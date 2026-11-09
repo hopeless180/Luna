@@ -73,6 +73,7 @@ let lastError = null;
 /** 测试与「索引已更新」后手动清缓存用 */
 export function resetIndexCache() {
   countCache = { path: null, mtimeMs: -1, works: 0 };
+  titleCache = { path: null, mtimeMs: -1, exact: null, loose: null };
   lastError = null;
 }
 
@@ -234,4 +235,88 @@ export function planDlsiteFill(work, album = {}, { maxTagName = 24 } = {}) {
     else plan.tags.push(item);
   }
   return plan;
+}
+
+/* -------------------------------------------------- 标题反查（实验：目录补 RJ 号） */
+
+/**
+ * 与 lookupWork **方向相反**：库里缺 RJ 号、只有目录名/标题，要拿标题去索引找候选。
+ * 规则仍然不猜：
+ *   1. 精确键 = 全角转半角 + 小写 + 去空白（括号内容保留）；
+ *   2. 落空再用宽松键 = 再去掉标点括号与残留的 RJ 号（`原名` 与 `原名【RJ123】` 等价）；
+ *   3. 同名多作品交给调用方按社团消歧，消不掉就放弃。
+ */
+const toHalfWidthLocal = (s) => String(s ?? '')
+  .replace(/[\uFF01-\uFF5E]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xfee0))
+  .replace(/\u3000/g, ' ');
+
+const TITLE_PUNCT_RE = /[（）()［］【】{}「」『』、。，．,.\-_:：;；+＋/／\\|~～〜!！?？'"“”„‘’·•]/g;
+
+export function exactTitleKey(text) {
+  return toHalfWidthLocal(text).toLowerCase().replace(/\s+/g, '');
+}
+
+export function looseTitleKey(text) {
+  return exactTitleKey(text).replace(TITLE_PUNCT_RE, '').replace(/rj\d{6,8}/g, '');
+}
+
+/**
+ * 「标题键 → 候选作品」两张表。索引没有 title 索引列，与其逐条 LIKE 全表扫，
+ * 不如一次读全表（7.8 万行，约一百毫秒）建 Map；与 countCache 同样按「路径+mtime」
+ * 失效，换索引文件后下一次查询自动重建。连接依旧用完即关。
+ */
+let titleCache = { path: null, mtimeMs: -1, exact: null, loose: null };
+
+function pushBucket(map, key, item) {
+  if (!key) return;
+  const list = map.get(key);
+  if (list) list.push(item);
+  else map.set(key, [item]);
+}
+
+function ensureTitleMaps() {
+  const opened = openIndex();
+  if (!opened) return null;
+  try {
+    if (titleCache.exact && titleCache.path === opened.file && titleCache.mtimeMs === opened.mtimeMs) {
+      return titleCache;
+    }
+    const exact = new Map();
+    const loose = new Map();
+    for (const row of opened.db.prepare('SELECT rj, circle, title FROM works').all()) {
+      const item = {
+        rj: normalizeRj(row.rj) ?? String(row.rj ?? '').toUpperCase(),
+        circle: cleanText(row.circle) || null,
+        title: cleanText(row.title) || null,
+      };
+      if (!item.rj) continue;
+      const ek = exactTitleKey(item.title);
+      pushBucket(exact, ek, item);
+      const lk = looseTitleKey(item.title);
+      if (lk && lk !== ek) pushBucket(loose, lk, item);
+    }
+    titleCache = { path: opened.file, mtimeMs: opened.mtimeMs, exact, loose };
+    return titleCache;
+  } catch (err) {
+    lastError = err.message;
+    return null;
+  } finally {
+    closeQuietly(opened.db);
+  }
+}
+
+/**
+ * 按标题在索引里找候选作品，只给候选、不做裁决（唯一/歧义/社团消歧由调用方决定）。
+ * @returns {{available:boolean, matches:Array<{rj:string,circle:string|null,title:string|null}>, how:'exact'|'loose'|'none'}}
+ */
+export function findWorksByTitle(title) {
+  const maps = ensureTitleMaps();
+  if (!maps) return { available: false, matches: [], how: 'none' };
+  const text = String(title ?? '').trim();
+  if (!text) return { available: true, matches: [], how: 'none' };
+  const ek = exactTitleKey(text);
+  if (ek && maps.exact.has(ek)) return { available: true, matches: maps.exact.get(ek), how: 'exact' };
+  const lk = looseTitleKey(text);
+  if (lk && maps.loose.has(lk)) return { available: true, matches: maps.loose.get(lk), how: 'loose' };
+  return { available: true, matches: [], how: 'none' };
 }

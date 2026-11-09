@@ -1038,6 +1038,22 @@ export function listVoiceAlbumsWithRj() {
 }
 
 /**
+ * 所有**缺 RJ 号**的音声发行（实验功能「目录补 RJ」的输入）。
+ *
+ * 与 listVoiceAlbumsWithRj 互补：那张是「路径里已经认得出 RJ」，
+ * 这张是「路径/标签里都没有」——正是按标题反查索引、回填目录名的对象。
+ */
+export function listVoiceAlbumsMissingRj() {
+  return db.prepare(`
+    SELECT id, COALESCE(title, '') AS title, COALESCE(circle, '') AS circle,
+           COALESCE(release_root, '') AS release_root
+    FROM albums
+    WHERE kind = 'voice' AND (rj_code IS NULL OR TRIM(rj_code) = '')
+    ORDER BY id
+  `).all();
+}
+
+/**
  * 某个压缩包当前挂在哪些类别的专辑上（v1.2.6）。
  *
  * 用途：压缩包有「size + mtime 没变就整包跳过」的快路径，而**判定规则变了**时

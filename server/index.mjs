@@ -18,6 +18,7 @@ import * as maintenance from './maintenance.mjs';
 import * as collection from './collection.mjs';
 import * as gallery from './gallery.mjs';
 import * as dlsite from './dlsite.mjs';
+import * as refillRj from './refill-rj.mjs';
 import { analyzeRelease } from './asmr.mjs';
 
 /** 视频轨要用 video/* 才能被浏览器的 <video> 播放 */
@@ -154,6 +155,24 @@ app.get('/api/stats', (req, res) => {
     lastBackupAt: assets.lastBackupAt(),
   });
 });
+
+/* ------------------------------------------- 实验功能：目录名末尾补【RJ号】 */
+
+/*
+ * 两步分开：plan 只读（标题/目录名 → DLsite 索引反查，结果可反复预览），
+ * apply 才动盘（重命名 + 删旧记录 + 按新路径重扫，破坏性由界面确认后执行）。
+ * 判定与边界见 server/refill-rj.mjs 头注释。
+ */
+app.post('/api/experimental/refill-rj/plan', asyncRoute(async (req, res) => {
+  res.json(refillRj.planRefill());
+}));
+
+app.post('/api/experimental/refill-rj/apply', asyncRoute(async (req, res) => {
+  const albumIds = (Array.isArray(req.body?.albumIds) ? req.body.albumIds : [])
+    .map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  if (!albumIds.length) return badRequest(res, '未选择要回填的目录');
+  res.json(await refillRj.applyRefill(albumIds));
+}));
 
 /* ---------------------------------------------------------------- libraries */
 

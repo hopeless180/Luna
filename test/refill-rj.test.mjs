@@ -1,0 +1,184 @@
+/**
+ * 实验功能「目录名末尾补【RJ号】」（server/refill-rj.mjs）。
+ *
+ * 覆盖：
+ *   1) planRefill 的裁决：精确命中 / 宽松命中 / 同名多义 / 社团消歧 / 各种如实跳过
+ *   2) applyRefill 的端到端：真实重命名 → 旧记录删除 → 按新路径重扫入库，
+ *      并且主链路（locateRelease → dlsite 补齐）自动把 rj_code / 社团 / 声优填回来
+ * 索引用与真实文件同构的小库，音乐库与数据目录都是临时目录。
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { test } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
+
+const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lam-refill-'));
+const dataDir = path.join(root, 'data');
+const asmrLib = path.join(root, 'Music', 'ASMR');
+fs.mkdirSync(dataDir, { recursive: true });
+fs.mkdirSync(asmrLib, { recursive: true });
+
+/* 造一份与真实索引同构的小库 */
+const indexFile = path.join(root, 'rj_index.sqlite3');
+{
+  const db = new DatabaseSync(indexFile);
+  db.exec(`
+    CREATE TABLE works (
+      rj TEXT PRIMARY KEY,
+      circle TEXT,
+      voice_actors TEXT,
+      voice_actor_text TEXT,
+      title TEXT,
+      release_date TEXT,
+      updated_at TEXT
+    );
+  `);
+  const ins = db.prepare('INSERT INTO works (rj, circle, voice_actors, title, release_date) VALUES (?, ?, ?, ?, ?)');
+  ins.run('RJ01010101', '唯一社', '["声优甲"]', '唯一命中作品', '2024-01-01');
+  ins.run('RJ02020202', '甲社团', '["声优乙"]', '重名作品', '');
+  ins.run('RJ03030303', '乙社团', '["声优丙"]', '重名作品', '');
+  ins.run('RJ04040404', '标点社', '[]', '带【装饰】作品（バイノーラル）', '');
+  ins.run('RJ05050505', '已存在社', '[]', '撞名作品', '');
+  db.close();
+}
+
+process.env.LAM_DATA_DIR = dataDir;
+process.env.LUNA_DLSITE_INDEX = indexFile;
+
+const store = await import('../server/db.mjs');
+const dlsite = await import('../server/dlsite.mjs');
+const refill = await import('../server/refill-rj.mjs');
+
+// plan 只认「已注册音乐库之下」的目录，先把 ASMR 库注册上
+store.addLibrary(asmrLib);
+
+/** 造一个发行目录 + 对应专辑行；withAudio 用于要真正重扫入库的端到端用例 */
+function makeAlbum({ folder, title = null, circle = null, withAudio = false }) {
+  const dir = path.join(asmrLib, folder);
+  fs.mkdirSync(dir, { recursive: true });
+  if (withAudio) fs.writeFileSync(path.join(dir, '01 本篇.mp3'), Buffer.from('fake-audio'.repeat(30)));
+  const id = store.upsertVoiceAlbum({ releaseRoot: dir, title });
+  if (circle) store.setAlbumCircle(id, circle);
+  return { id, dir };
+}
+
+/* ------------------------------------------------------------------ plan */
+
+test('plan：专辑标题精确命中唯一作品 → 生成候选（原名 + 【RJ号】）', () => {
+  const { id, dir } = makeAlbum({ folder: '目录一号', title: '唯一命中作品' });
+  const item = refill.planRefill().items.find((it) => it.album_id === id);
+  assert.ok(item, '精确命中的专辑必须进候选');
+  assert.equal(item.rj, 'RJ01010101');
+  assert.equal(item.old_path, dir);
+  assert.equal(item.new_path, `${dir}【RJ01010101】`);
+  assert.match(item.how, /^按标题/);
+});
+
+test('plan：同名多作品且没填社团 → 如实跳过（不猜）', () => {
+  const { id } = makeAlbum({ folder: '目录二号', title: '重名作品' });
+  const skipped = refill.planRefill().skipped.find((it) => it.album_id === id);
+  assert.ok(skipped);
+  assert.match(skipped.reason, /无法唯一定/);
+});
+
+test('plan：同名多作品 + 社团消歧成功 → 候选并标注命中方式', () => {
+  const { id } = makeAlbum({ folder: '目录三号', title: '重名作品', circle: '乙社团' });
+  const item = refill.planRefill().items.find((it) => it.album_id === id);
+  assert.ok(item);
+  assert.equal(item.rj, 'RJ03030303');
+  assert.match(item.how, /社团/);
+});
+
+test('plan：括号标点差异走宽松键命中', () => {
+  // 索引标题「带【装饰】作品（バイノーラル）」：精确键不等（括号内容还在），宽松键相等
+  const { id } = makeAlbum({ folder: '目录四号', title: '带【装饰】作品-バイノーラル' });
+  const item = refill.planRefill().items.find((it) => it.album_id === id);
+  assert.ok(item, '宽松键应当命中');
+  assert.equal(item.rj, 'RJ04040404');
+  assert.match(item.how, /宽松/);
+});
+
+test('plan：目录名已有 RJ / 虚拟路径 / 目录不存在 / 库根 / 目标撞名 → 各按原因跳过', () => {
+  const inName = makeAlbum({ folder: '作品 RJ123218', title: '唯一命中作品' });
+  // 虚拟路径（压缩包成员形态）：分隔符 0x01
+  const virtualId = store.upsertVoiceAlbum({
+    releaseRoot: `${path.join(asmrLib, '包.zip')}\u0001sub`, title: '唯一命中作品',
+  });
+  const goneId = store.upsertVoiceAlbum({
+    releaseRoot: path.join(asmrLib, '已经不存在的目录'), title: '唯一命中作品',
+  });
+  const libRootId = store.upsertVoiceAlbum({ releaseRoot: asmrLib, title: '唯一命中作品' });
+  const clash = makeAlbum({ folder: '撞名作品', title: '撞名作品' });
+  fs.mkdirSync(`${clash.dir}【RJ05050505】`, { recursive: true });
+
+  const reasons = new Map(refill.planRefill().skipped.map((it) => [it.album_id, it.reason]));
+  assert.match(reasons.get(inName.id), /已经有 RJ 号/);
+  assert.match(reasons.get(virtualId), /压缩包|虚拟路径/);
+  assert.match(reasons.get(goneId), /目录已不存在/);
+  assert.ok(reasons.has(libRootId), '库根本身不许动');
+  assert.match(reasons.get(clash.id), /目标目录名已存在/);
+});
+
+test('plan：不在已注册音乐库之下的目录不许动', () => {
+  const dir = path.join(root, 'Music', 'Elsewhere', '散养作品');
+  fs.mkdirSync(dir, { recursive: true });
+  const id = store.upsertVoiceAlbum({ releaseRoot: dir, title: '唯一命中作品' });
+  const skipped = refill.planRefill().skipped.find((it) => it.album_id === id);
+  assert.ok(skipped, '库外目录必须被拦下');
+  assert.match(skipped.reason, /音乐库/);
+});
+
+test('索引缺失时 plan 如实报告、不抛错', () => {
+  const saved = process.env.LUNA_DLSITE_INDEX;
+  process.env.LUNA_DLSITE_INDEX = path.join(root, '没有这个文件.sqlite3');
+  dlsite.resetIndexCache();
+  try {
+    const plan = refill.planRefill();
+    assert.equal(plan.index.available, false);
+    assert.equal(plan.items.length, 0);
+  } finally {
+    process.env.LUNA_DLSITE_INDEX = saved;
+    dlsite.resetIndexCache();
+  }
+});
+
+/* ----------------------------------------------------------------- apply */
+
+test('apply：重命名目录 → 旧记录删除 → 重扫后按路径识别出 RJ 并由索引补齐社团/声优', async () => {
+  const { id, dir } = makeAlbum({ folder: '端到端作品', title: '唯一命中作品', withAudio: true });
+  const item = refill.planRefill().items.find((it) => it.album_id === id);
+  assert.ok(item);
+
+  const res = await refill.applyRefill([id]);
+  assert.equal(res.renamed, 1, `应当改名成功：${JSON.stringify(res.details.failed)}`);
+  assert.equal(res.failed, 0);
+
+  // 磁盘：旧名消失、新名存在
+  assert.ok(!fs.existsSync(dir), '旧目录名应当不存在了');
+  const newPath = `${dir}【RJ01010101】`;
+  assert.ok(fs.existsSync(newPath), '新目录名应当存在');
+
+  // 库：旧专辑行整块删除（用户拍板的破坏性语义）
+  assert.equal(store.getAlbumById(id), null, '旧记录应当被删除');
+
+  // 主链路重建：新路径里有 RJ → locateRelease 认出 → dlsite 按索引补齐
+  const rebuilt = store.findVoiceAlbum(newPath);
+  assert.ok(rebuilt, '重扫后应当按新路径重建专辑');
+  assert.equal(rebuilt.rj_code, 'RJ01010101');
+  assert.equal(rebuilt.circle, '唯一社');
+  assert.equal(rebuilt.album_artist, '声优甲');
+  assert.equal(rebuilt.kind, 'voice');
+});
+
+test('apply：不在候选里的 id 不会被动盘', async () => {
+  const { dir } = makeAlbum({ folder: '没在候选里', title: '索引里没有这个标题' });
+  const plan = refill.planRefill();
+  const notPlanned = plan.skipped.find((it) => it.folder === '没在候选里');
+  assert.ok(notPlanned, '查不到的应当只进 skipped');
+  const res = await refill.applyRefill([notPlanned.album_id]);
+  assert.equal(res.renamed, 0);
+  assert.equal(res.failed, 0);
+  assert.ok(fs.existsSync(dir), '磁盘目录必须原样保留');
+});

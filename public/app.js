@@ -2051,6 +2051,7 @@ async function loadStats() {
           <button class="btn" id="gcCoversBtn">回收无用封面</button>
           <button class="btn" id="pruneMissingBtn">清理失效索引</button>
           <button class="btn" id="clearThumbsBtn">清理缩略图缓存</button>
+          <button class="btn" id="refillRjBtn" title="实验功能：按 DLsite 索引把缺号音声目录改名补【RJ号】；旧入库记录会删除并按新目录名重建">补RJ号（实验）</button>
         </div>
       </div>
     </div>
@@ -2111,6 +2112,59 @@ async function loadStats() {
       loadStats();
     } catch {
       toast('当前浏览器不支持缓存管理', true);
+    }
+  });
+
+  $('#refillRjBtn')?.addEventListener('click', async () => {
+    const btn = $('#refillRjBtn');
+    btn.disabled = true;
+    try {
+      // 第一步：只读预览（可反复看，不落任何改动）
+      const plan = await api('/api/experimental/refill-rj/plan', { method: 'POST', body: {} });
+      if (!plan.index.available) {
+        toast('没有可用的 DLsite 索引（Dlsite/rj_index.sqlite3），无法比对', true);
+        return;
+      }
+      if (!plan.items.length) {
+        toast(`扫描了 ${plan.checked} 张缺号发行：没有能唯一匹配到 RJ 号的目录`);
+        return;
+      }
+      const preview = plan.items.slice(0, 6)
+        .map((it) => `${it.folder} → 【${it.rj}】（${it.how}）`)
+        .join('\n');
+      const more = plan.items.length > 6 ? `\n…共 ${plan.items.length} 个` : '';
+      const warn = '\n\n注意：这些专辑的旧入库记录（标签、收藏）会删除，按新目录名重建。';
+      const textEl = $('#confirmText');
+      textEl.style.whiteSpace = 'pre-line';
+      let ok = false;
+      try {
+        ok = await askConfirm({
+          title: `目录名补【RJ号】：${plan.items.length} 个`,
+          text: `${preview}${more}${warn}`,
+          okLabel: '重命名并重建',
+          danger: true,
+        });
+      } finally {
+        textEl.style.whiteSpace = '';
+      }
+      if (!ok) return;
+      // 第二步：真正动盘（服务端会重新核对一遍，陈旧预览自动落空）
+      const res = await api('/api/experimental/refill-rj/apply', {
+        method: 'POST',
+        body: { albumIds: plan.items.map((it) => it.album_id) },
+      });
+      const fails = res.details?.failed ?? [];
+      toast(
+        res.failed
+          ? `已重命名 ${res.renamed} 个，失败 ${res.failed} 个：${fails.map((f) => `${f.folder}（${f.reason}）`).join('；')}`
+          : `已重命名 ${res.renamed} 个目录并按新路径重建，无需再手动扫描`,
+        res.failed > 0,
+      );
+      loadStats();
+    } catch (err) {
+      toast(`补 RJ 号失败：${err.message}`, true);
+    } finally {
+      btn.disabled = false;
     }
   });
 }
