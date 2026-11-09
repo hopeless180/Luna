@@ -76,11 +76,13 @@ test('plan：专辑标题精确命中唯一作品 → 生成候选（原名 + �
   assert.match(item.how, /^按标题/);
 });
 
-test('plan：同名多作品且没填社团 → 如实跳过（不猜）', () => {
+test('plan：同名多作品且没填社团 → 进人工确认区，候选给全（不只挑一个）', () => {
   const { id } = makeAlbum({ folder: '目录二号', title: '重名作品' });
-  const skipped = refill.planRefill().skipped.find((it) => it.album_id === id);
-  assert.ok(skipped);
-  assert.match(skipped.reason, /无法唯一定/);
+  const rv = refill.planRefill().review.find((it) => it.album_id === id);
+  assert.ok(rv, '歧义必须进确认区而不是丢弃');
+  assert.equal(rv.candidates.length, 2);
+  assert.deepEqual(rv.candidates.map((c) => c.rj).sort(), ['RJ02020202', 'RJ03030303']);
+  assert.ok(!refill.planRefill().skipped.some((it) => it.album_id === id));
 });
 
 test('plan：同名多作品 + 社团消歧成功 → 候选并标注命中方式', () => {
@@ -128,6 +130,38 @@ test('plan：不在已注册音乐库之下的目录不许动', () => {
   const skipped = refill.planRefill().skipped.find((it) => it.album_id === id);
   assert.ok(skipped, '库外目录必须被拦下');
   assert.match(skipped.reason, /音乐库/);
+});
+
+test('plan：标题差几个字符 → 进确认区给近似候选（前几名，按相似度）', () => {
+  // 索引里是「带【装饰】作品（バイノーラル）」，这里少了尾缀、括号也不同 → 精确/宽松都不等
+  const { id } = makeAlbum({ folder: '近似作品', title: '带装饰作品バイノー' });
+  const rv = refill.planRefill().review.find((it) => it.album_id === id);
+  assert.ok(rv, '查不到精确名但应有近似候选，进确认区');
+  assert.ok(rv.candidates.length >= 1);
+  assert.equal(rv.candidates[0].rj, 'RJ04040404');
+  assert.ok(rv.candidates[0].score < 1, '近似的相似度应小于 1');
+  assert.ok(!refill.planRefill().items.some((it) => it.album_id === id), '近似绝不自动进 items');
+});
+
+test('apply：只点选确认区里的合法候选才改名；不在最新候选里的选择被拒', async () => {
+  const { id, dir } = makeAlbum({ folder: '点选作品', title: '带装饰作品バイノー', withAudio: true });
+  const rv = refill.planRefill().review.find((it) => it.album_id === id);
+  assert.ok(rv);
+
+  // 先试一个不在候选里的 RJ（模拟陈旧/篡改）→ 应落空，不动盘
+  const bad = await refill.applyRefill([id], { choices: { [id]: 'RJ99999999' } });
+  assert.equal(bad.renamed, 0);
+  assert.equal(bad.failed, 1);
+  assert.match(bad.details.failed[0].reason, /不在最新候选/);
+  assert.ok(fs.existsSync(dir), '非法选择不能改名');
+
+  // 用候选里真实的第一名 → 成功，how 标注人工确认
+  const chosen = rv.candidates[0].rj;
+  const ok = await refill.applyRefill([id], { choices: { [id]: chosen } });
+  assert.equal(ok.renamed, 1);
+  assert.equal(ok.details.renamed[0].rj, chosen);
+  assert.match(ok.details.renamed[0].how, /人工确认/);
+  assert.ok(fs.existsSync(`${dir}【${chosen}】`));
 });
 
 test('索引缺失时 plan 如实报告、不抛错', () => {

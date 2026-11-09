@@ -320,3 +320,80 @@ export function findWorksByTitle(title) {
   if (lk && maps.loose.has(lk)) return { available: true, matches: maps.loose.get(lk), how: 'loose' };
   return { available: true, matches: [], how: 'none' };
 }
+
+/* ---------------------------------------------------------------- 近似检索 */
+
+/**
+ * 「差几个字符」找相似：宽松键切二元 gram，Dice 系数 + 子集包含（短方全被包含时按 1 分，
+ * 例如本地标题是索引名 + 副题）。**只当候选、绝不当结论**：调用方必须把结果交人工挑选。
+ */
+function gramSet(key) {
+  const set = new Set();
+  if (key.length === 1) set.add(key);
+  for (let i = 0; i + 1 < key.length; i += 1) set.add(key.slice(i, i + 2));
+  return set;
+}
+
+function ensureGramIndex() {
+  const maps = ensureTitleMaps();
+  if (!maps) return null;
+  if (!maps.bi) {
+    const bi = new Map();
+    const unique = new Set();
+    for (const map of [maps.exact, maps.loose]) {
+      for (const list of map.values()) {
+        for (const item of list) {
+          if (unique.has(item)) continue;
+          unique.add(item);
+          if (!item._g) item._g = gramSet(looseTitleKey(item.title));
+          for (const g of item._g) {
+            const bucket = bi.get(g);
+            if (bucket) bucket.push(item);
+            else bi.set(g, [item]);
+          }
+        }
+      }
+    }
+    maps.bi = bi;
+  }
+  return maps;
+}
+
+/**
+ * @param {string} title 本地标题/目录名
+ * @param {{limit?:number, minScore?:number}} opts
+ * @returns {{available:boolean, matches:Array<{rj,circle,title,score}>}} 按相似度降序的前 limit 个
+ */
+export function searchNearWorks(title, { limit = 5, minScore = 0.55 } = {}) {
+  const maps = ensureGramIndex();
+  if (!maps) return { available: false, matches: [] };
+  const qk = looseTitleKey(title);
+  if (qk.length < 3) return { available: true, matches: [] }; // 太短不比：'HLS01' 这种只会招噪声
+  const qg = gramSet(qk);
+  const shared = new Map(); // rj → { item, n }
+  for (const g of qg) {
+    const bucket = maps.bi.get(g);
+    if (!bucket) continue;
+    for (const item of bucket) {
+      const cur = shared.get(item.rj);
+      if (cur) cur.n += 1;
+      else shared.set(item.rj, { item, n: 1 });
+    }
+  }
+  const scored = [];
+  for (const { item, n } of shared.values()) {
+    if (n < 2) continue; // 只沾一个 gram 的不算「接近」
+    const cg = item._g.size;
+    const dice = (2 * n) / (qg.size + cg);
+    // 短方被完整包含（本地名是索引名截短/加料）算强近似,但**封顶 0.98**——
+    // 只有宽松键真正相等才是 1.0（那走 findWorksByTitle）,近似区永远拿不到满分,
+    // 「同名多作品」的 1 分候选由调用方自己构造,语义不混淆。
+    const contain = n >= Math.min(qg.size, cg) ? 0.98 : 0;
+    const score = Math.max(dice, contain);
+    if (score >= minScore) {
+      scored.push({ rj: item.rj, circle: item.circle, title: item.title, score: Math.round(score * 100) / 100 });
+    }
+  }
+  scored.sort((a, b) => b.score - a.score || String(a.rj).localeCompare(String(b.rj)));
+  return { available: true, matches: scored.slice(0, limit) };
+}

@@ -174,7 +174,8 @@ app.post('/api/experimental/refill-rj/apply', asyncRoute(async (req, res) => {
   const albumIds = (Array.isArray(req.body?.albumIds) ? req.body.albumIds : [])
     .map(Number).filter((n) => Number.isInteger(n) && n > 0);
   if (!albumIds.length) return badRequest(res, '未选择要回填的目录');
-  res.json(await refillRj.applyRefill(albumIds, { libraryId: parseId(req.body?.libraryId) }));
+  const choices = req.body?.choices && typeof req.body.choices === 'object' ? req.body.choices : {};
+  res.json(await refillRj.applyRefill(albumIds, { libraryId: parseId(req.body?.libraryId), choices }));
 }));
 
 /* ---------------------------------------------------------------- libraries */

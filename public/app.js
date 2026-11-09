@@ -2184,25 +2184,46 @@ async function refillDlgMatch() {
       refillDlgSetGo('开始匹配', 'btn btn-primary', () => refillDlgMatch());
       return;
     }
-    if (!plan.items.length) {
-      body.innerHTML = `<p class="hint" style="margin-top:8px">扫描了 ${plan.checked} 张缺号发行：没有能唯一匹配到 RJ 号的目录。</p>${refillSkipSummary(plan.skipped)}`;
+    const autoCount = plan.items.length;
+    const reviewCount = (plan.review ?? []).length;
+    if (!autoCount && !reviewCount) {
+      body.innerHTML = `<p class="hint" style="margin-top:8px">扫描了 ${plan.checked} 张缺号发行：没有能唯一匹配、也没有可参考的近似候选。</p>${refillSkipSummary(plan.skipped)}`;
       refillDlgSetGo('关闭', 'btn btn-primary', () => $('#refillRjDialog').close());
       return;
     }
     body.innerHTML = `
-      <p class="hint" style="margin:8px 0 4px">可补 <b>${plan.items.length}</b> 个（勾选要执行的）：</p>
-      ${plan.items.map((it) => `
-        <label style="display:flex;gap:8px;align-items:center;padding:4px 2px">
-          <input type="checkbox" checked data-refill-id="${it.album_id}" />
-          <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
-                title="${esc(it.old_path)}">${esc(it.folder)} <b>→【${esc(it.rj)}】</b></span>
-          <span class="hint">${esc(it.how)}</span>
-        </label>`).join('')}
+      ${autoCount ? `
+        <p class="hint" style="margin:8px 0 4px">完全匹配 <b>${autoCount}</b> 个（勾选要执行的）：</p>
+        ${plan.items.map((it) => `
+          <label style="display:flex;gap:8px;align-items:center;padding:4px 2px">
+            <input type="checkbox" checked data-refill-id="${it.album_id}" />
+            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                  title="${esc(it.old_path)}">${esc(it.folder)} <b>→【${esc(it.rj)}】</b></span>
+            <span class="hint">${esc(it.how)}</span>
+          </label>`).join('')}` : ''}
+      ${reviewCount ? `
+        <p class="hint" style="margin:10px 0 4px">不完全一致、但有近似候选的 <b>${reviewCount}</b> 个——
+          请逐个点认（默认「都不是」，不选就跳过）：</p>
+        ${plan.review.map((rv) => `
+          <div class="refill-review" data-album="${rv.album_id}" style="border:1px solid rgba(125,108,245,.25);border-radius:8px;padding:6px 8px;margin:6px 0">
+            <p style="margin:0 0 2px"><b>${esc(rv.folder)}</b>
+              ${rv.title && rv.title !== rv.folder ? `<span class="hint">（标题：${esc(rv.title).slice(0, 60)}）</span>` : ''}</p>
+            ${rv.hint ? `<p class="hint" style="margin:0 0 4px;opacity:.85">${esc(rv.hint)}</p>` : ''}
+            <label style="display:flex;gap:8px;align-items:center;padding:3px 2px">
+              <input type="radio" name="near-${rv.album_id}" value="" checked /> 都不是，跳过
+            </label>
+            ${rv.candidates.map((c) => `
+              <label style="display:flex;gap:8px;align-items:center;padding:3px 2px">
+                <input type="radio" name="near-${rv.album_id}" value="${esc(c.rj)}" />
+                <span><b>${esc(c.rj)}</b> · ${esc(c.circle ?? '未知社团')} · ${esc(c.title ?? '')}</span>
+                <span class="hint">${Math.round(c.score * 100)}%</span>
+              </label>`).join('')}
+          </div>`).join('')}` : ''}
       ${refillSkipSummary(plan.skipped)}
       <p class="hint" style="margin-top:8px;color:var(--danger,#e57373)">
         执行后这些专辑的旧入库记录（标签、收藏）会删除并按新目录名重建；社团/声优会按索引重新补齐。
         改名本身可在下方「写操作记录」撤销。</p>`;
-    refillDlgSetGo(`重命名所选 ${plan.items.length} 个`, 'btn btn-danger', () => refillDlgApply());
+    refillDlgSetGo(`执行重命名（自动 ${autoCount} + 待确认 ${reviewCount}）`, 'btn btn-danger', () => refillDlgApply());
   } catch (e) {
     err.textContent = `匹配失败：${e.message}`;
     err.hidden = false;
@@ -2217,6 +2238,16 @@ async function refillDlgApply() {
   const ids = $$('#refillRjDlgBody [data-refill-id]')
     .filter((el) => el.checked)
     .map((el) => Number(el.dataset.refillId));
+  // 近似候选区：只带「用户真点了某个候选」的专辑；选「都不是」的不发
+  const choices = {};
+  for (const block of $$('#refillRjDlgBody .refill-review')) {
+    const hit = block.querySelector('input[type="radio"]:checked');
+    if (hit && hit.value) {
+      const id = Number(block.dataset.album);
+      ids.push(id);
+      choices[id] = hit.value;
+    }
+  }
   if (!ids.length) { toast('没有勾选任何目录', true); return; }
   refillDlg.busy = true;
   const go = $('#refillRjDlgGo');
@@ -2224,7 +2255,7 @@ async function refillDlgApply() {
   go.textContent = '执行中…';
   try {
     const res = await api('/api/experimental/refill-rj/apply', {
-      method: 'POST', body: { albumIds: ids, libraryId: refillDlg.libraryId },
+      method: 'POST', body: { albumIds: ids, libraryId: refillDlg.libraryId, choices },
     });
     const fails = res.details?.failed ?? [];
     toast(

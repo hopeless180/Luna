@@ -51,12 +51,12 @@ function libraryOwning(root, libraries) {
 
 /**
  * 为一张音声发行找到**能唯一确定**的索引作品。
- * 依次试专辑标题、目录名；多个候选时再用社团消歧。
- * @returns {{ok:true, work:object, how:string}|{ok:false, reason:string}}
+ * 依次试专辑标题、目录名；多个候选时先用社团消歧。
+ * @returns {{ok:true, work:object, how:string}|{ok:false, ambiguous?:boolean, works?:object[], reason:string}}
  */
 function resolveWork({ title, folder, circle }) {
   const want = String(circle ?? '').trim().toLowerCase();
-  let reason = '索引里查不到同名作品';
+  let ambiguity = null;
   for (const probe of [title, folder]) {
     const text = String(probe ?? '').trim();
     if (!text) continue;
@@ -71,9 +71,12 @@ function resolveWork({ title, folder, circle }) {
     if (picked.length === 1) {
       return { ok: true, work: picked[0], how: found.how === 'exact' ? '按标题+社团命中' : '按宽松标题+社团命中' };
     }
-    reason = '索引里同名作品不止一个，社团也无法唯一定';
+    // 同名多作品、社团也定不了 → 全部端出来让人挑（这本身就是「几个几乎接近的」）
+    ambiguity = { works: found.matches, reason: '同名作品不止一个：由你按社团辨认' };
   }
-  return { ok: false, reason };
+  return ambiguity
+    ? { ok: false, ambiguous: true, works: ambiguity.works, reason: ambiguity.reason }
+    : { ok: false, reason: '索引里查不到同名作品' };
 }
 
 /**
@@ -83,12 +86,13 @@ function resolveWork({ title, folder, circle }) {
 export function planRefill({ libraryId = null } = {}) {
   const index = dlsite.indexInfo();
   if (!index.available) {
-    return { index, checked: 0, items: [], skipped: [{ reason: '没有可用的 DLsite 索引文件' }] };
+    return { index, checked: 0, items: [], review: [], skipped: [{ reason: '没有可用的 DLsite 索引文件' }] };
   }
   const wantedLib = libraryId ? store.getLibrary(libraryId) : null;
   const rows = store.listVoiceAlbumsMissingRj();
   const libraries = store.listLibraries();
   const items = [];
+  const review = [];
   const skipped = [];
   const note = (album, reason) => skipped.push({
     album_id: album.id,
@@ -117,7 +121,23 @@ export function planRefill({ libraryId = null } = {}) {
     if (!owner) { note(album, '不在任何已注册音乐库之下（库根不动）'); continue; }
 
     const hit = resolveWork({ title: album.title, folder, circle: album.circle });
-    if (!hit.ok) { note(album, hit.reason); continue; }
+    if (!hit.ok) {
+      // 没有能自动拍板的结果 → 交人工确认区：同名歧义给**全部**同名，查不到给**几个**近似候选
+      const candidates = hit.ambiguous
+        ? hit.works.map((w) => ({ rj: w.rj, circle: w.circle, title: w.title, score: 1 }))
+        : nearCandidates({ title: album.title, folder });
+      if (!candidates.length) { note(album, hit.reason); continue; }
+      review.push({
+        album_id: album.id,
+        folder,
+        title: String(album.title ?? '').trim() || null,
+        library_id: owner.id,
+        old_path: root,
+        hint: hit.reason,
+        candidates,
+      });
+      continue;
+    }
 
     const newPath = `${root}【${hit.work.rj}】`;
     let clash = false;
@@ -137,21 +157,75 @@ export function planRefill({ libraryId = null } = {}) {
       new_path: newPath,
     });
   }
-  return { index, checked, items, skipped };
+  return { index, checked, items, review, skipped };
+}
+
+/**
+ * 近似候选（标题与目录名两路探测、按 RJ 合并取最高分），供**人工确认区**展示。
+ * 只给候选；选谁（或都不选）由用户决定，apply 端还会对着新计算的候选再校验一次。
+ */
+function nearCandidates({ title, folder }) {
+  const byRj = new Map();
+  for (const probe of [title, folder]) {
+    const text = String(probe ?? '').trim();
+    if (!text) continue;
+    for (const c of dlsite.searchNearWorks(text, { limit: 5 }).matches) {
+      const cur = byRj.get(c.rj);
+      if (!cur || c.score > cur.score) byRj.set(c.rj, c);
+    }
+  }
+  return [...byRj.values()].sort((a, b) => b.score - a.score).slice(0, 5);
 }
 
 /**
  * 执行重命名（破坏性，用户已确认）：登记写任务 → 改名 → 删旧记录 → 按新路径重扫入库。
  * `albumIds` 必须来自**同一批预览**；这里会重新 plan 一次再按 id 过滤，
  * 磁盘或索引在预览后变了的话，对不上的条目自动落空，绝不按陈旧预览硬改。
+ * `choices`（{album_id: rj}）来自近似候选的人工点选：服务端拿**刚算出的候选**核对，
+ * rj 不在候选里的条目直接落空——陈旧或被篡改的选择绝不会被用来改名。
  */
-export async function applyRefill(albumIds, { libraryId = null } = {}) {
+export async function applyRefill(albumIds, { libraryId = null, choices = {} } = {}) {
   if (isScanning()) throw new Error('扫描正在进行，请先结束扫描再执行回填');
   if (isWriting()) throw new Error('正在写回文件，请等写入结束后再执行回填');
   const wanted = new Set((albumIds ?? []).map(Number).filter(Number.isFinite));
-  const plan = planRefill({ libraryId }).items.filter((it) => wanted.has(it.album_id));
+  const fresh = planRefill({ libraryId });
+  const plan = fresh.items.filter((it) => wanted.has(it.album_id));
+
+  // 人工确认区：id 在 wanted 里且带合法选择才算数
+  const chosenFailed = [];
+  const picked = new Map();
+  for (const rv of fresh.review) {
+    if (!wanted.has(rv.album_id)) continue;
+    const rj = dlsite.normalizeRj(choices?.[rv.album_id] ?? choices?.[String(rv.album_id)]);
+    if (!rj) continue; // 没选 = 跳过，不算失败
+    const cand = rv.candidates.find((c) => c.rj === rj);
+    if (!cand) {
+      chosenFailed.push({ album_id: rv.album_id, folder: rv.folder, rj, reason: '该 RJ 号不在最新候选里（索引或磁盘变了？请重新匹配）' });
+      continue;
+    }
+    const newPath = `${rv.old_path}【${rj}】`;
+    let clash = false;
+    try { clash = fs.existsSync(newPath); } catch { clash = true; }
+    if (clash) { chosenFailed.push({ album_id: rv.album_id, folder: rv.folder, rj, reason: '目标目录名已存在' }); continue; }
+    if (newPath.length > MAX_NEW_PATH) { chosenFailed.push({ album_id: rv.album_id, folder: rv.folder, rj, reason: `重命名后路径过长（${newPath.length} 字符）` }); continue; }
+    picked.set(rv.album_id, {
+      album_id: rv.album_id,
+      folder: rv.folder,
+      rj,
+      how: cand.score >= 1
+        ? '同名多作品·人工按社团确认'
+        : `近似候选·人工确认（${Math.round(cand.score * 100)}%）`,
+      work_title: cand.title,
+      work_circle: cand.circle,
+      library_id: rv.library_id,
+      old_path: rv.old_path,
+      new_path: newPath,
+    });
+  }
+  // 自动候选 + 人工确认候选合并（同一专辑两者只会有一种）
+  for (const it of picked.values()) plan.push(it);
   if (!plan.length) {
-    return { jobId: null, renamed: 0, failed: 0, details: { renamed: [], failed: [] } };
+    return { jobId: null, renamed: 0, failed: chosenFailed.length, details: { renamed: [], failed: chosenFailed } };
   }
 
   const jobInfo = db.prepare(`
@@ -169,7 +243,7 @@ export async function applyRefill(albumIds, { libraryId = null } = {}) {
   );
 
   const renamed = [];
-  const failed = [];
+  const failed = chosenFailed.slice(); // 人工选择失效的条目一并如实汇报
   for (let i = 0; i < plan.length; i += 1) {
     const it = plan[i];
     try {
