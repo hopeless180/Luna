@@ -320,19 +320,62 @@
   </div>
 </div>
 
-<!-- 实验功能：目录名末尾补【RJ号】（选库 → 预览 → 执行，流程见 app.js 的 openRefillRjDialog） -->
-<dialog class="dlg" id="refillRjDialog">
-  <form method="dialog">
-    <h3>目录名补【RJ号】（实验）</h3>
-    <p class="hint">按 DLsite 索引标题反查，只列能**唯一命中**的目录；查不到、有歧义的一律不猜。</p>
-    <div id="refillRjDlgBody"></div>
-    <div class="dlg-actions">
-      <span class="spacer"></span>
-      <button class="btn btn-ghost" type="button" id="refillRjDlgCancel">取消</button>
-      <button class="btn btn-primary" type="button" id="refillRjDlgGo">开始匹配</button>
+<!-- 实验功能：目录名比对补全（宽版窗口：选库 → 汇总 → 过滤 → 表格勾选/点认 → 执行） -->
+<dialog class="dlg dlg-wide" id="refillRjDialog">
+  <div class="rf-shell">
+    <div class="rf-head">
+      <div class="rf-title">
+        <h3>目录名比对补全</h3>
+        <span class="rf-sub">按 DLsite 索引标题反查 · 缺号目录末尾补【RJ号】</span>
+      </div>
+      <div class="rf-root">
+        <span class="rf-root-label">根目录</span>
+        <select id="refillRjLib" title="选择要操作的库"></select>
+        <button class="btn" type="button" id="refillRjRescan">重新匹配</button>
+        <button class="icon-btn rf-close" type="button" id="refillRjDlgCancel" title="关闭">✕</button>
+      </div>
+    </div>
+
+    <div class="rf-summary" id="refillRjSummary"></div>
+
+    <div class="rf-toolbar">
+      <div class="rf-tabs" id="refillRjTabs"></div>
+      <div class="rf-tools">
+        <input type="search" id="refillRjSearch" placeholder="搜索目录名或标题…" autocomplete="off" />
+        <label class="rf-threshold" title="低于该相似度的待确认条目不再显示">
+          阈值 <input type="range" id="refillRjThreshold" min="55" max="100" step="1" value="55" />
+          <b id="refillRjThresholdLabel">55%</b>
+        </label>
+      </div>
+    </div>
+
+    <div class="rf-table-wrap">
+      <table class="rf-table">
+        <thead>
+          <tr>
+            <th class="rf-col-pick"></th>
+            <th>目录名</th>
+            <th class="rf-col-state">状态</th>
+            <th>数据库匹配 / 补全为</th>
+            <th class="rf-col-score">相似度</th>
+            <th class="rf-col-op">操作</th>
+          </tr>
+        </thead>
+        <tbody id="refillRjTbody"></tbody>
+      </table>
+      <div class="rf-empty" id="refillRjEmpty" hidden></div>
+    </div>
+
+    <div class="rf-foot">
+      <span class="rf-foot-info" id="refillRjFootInfo">已选 0 项</span>
+      <span class="rf-foot-note">执行会删除所选专辑的旧记录并按新目录名重建 · 可在「写操作记录」撤销</span>
+      <div class="rf-foot-actions">
+        <button class="btn btn-ghost" type="button" id="refillRjDlgCancel2">取消</button>
+        <button class="btn btn-danger" type="button" id="refillRjDlgGo" disabled>执行补全</button>
+      </div>
     </div>
     <div class="dlg-error" id="refillRjDlgError" hidden></div>
-  </form>
+  </div>
 </dialog>
 
 <!-- 通用确认框（替代 Electron 不支持的 window.confirm） -->
