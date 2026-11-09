@@ -1987,7 +1987,7 @@ async function loadTagsView() {
 /* ============================================================== 视图：统计 */
 
 async function loadStats() {
-  const { stats, lastBackupAt } = await api('/api/stats');
+  const { stats, lastBackupAt, libraries } = await api('/api/stats');
   const thumbs = await thumbCacheStats();
   const coverUsage = await api('/api/maintenance/usage').catch(() => null);
   const jobs = await api('/api/jobs?limit=8').catch(() => ({ jobs: [] }));
@@ -2051,6 +2051,10 @@ async function loadStats() {
           <button class="btn" id="gcCoversBtn">回收无用封面</button>
           <button class="btn" id="pruneMissingBtn">清理失效索引</button>
           <button class="btn" id="clearThumbsBtn">清理缩略图缓存</button>
+          <select id="refillRjLib" class="btn" title="「补RJ号」只处理这个音乐库；选「全部音乐库」则处理整个库" style="max-width:150px">
+            <option value="">全部音乐库</option>
+            ${(libraries ?? []).map((l) => `<option value="${l.id}">${esc(l.display_name ?? l.path)}</option>`).join('')}
+          </select>
           <button class="btn" id="refillRjBtn" title="实验功能：按 DLsite 索引把缺号音声目录改名补【RJ号】；旧入库记录会删除并按新目录名重建">补RJ号（实验）</button>
         </div>
       </div>
@@ -2117,10 +2121,11 @@ async function loadStats() {
 
   $('#refillRjBtn')?.addEventListener('click', async () => {
     const btn = $('#refillRjBtn');
+    const libraryId = Number($('#refillRjLib')?.value ?? '') || null;
     btn.disabled = true;
     try {
       // 第一步：只读预览（可反复看，不落任何改动）
-      const plan = await api('/api/experimental/refill-rj/plan', { method: 'POST', body: {} });
+      const plan = await api('/api/experimental/refill-rj/plan', { method: 'POST', body: { libraryId } });
       if (!plan.index.available) {
         toast('没有可用的 DLsite 索引（Dlsite/rj_index.sqlite3），无法比对', true);
         return;
@@ -2151,13 +2156,13 @@ async function loadStats() {
       // 第二步：真正动盘（服务端会重新核对一遍，陈旧预览自动落空）
       const res = await api('/api/experimental/refill-rj/apply', {
         method: 'POST',
-        body: { albumIds: plan.items.map((it) => it.album_id) },
+        body: { albumIds: plan.items.map((it) => it.album_id), libraryId },
       });
       const fails = res.details?.failed ?? [];
       toast(
         res.failed
           ? `已重命名 ${res.renamed} 个，失败 ${res.failed} 个：${fails.map((f) => `${f.folder}（${f.reason}）`).join('；')}`
-          : `已重命名 ${res.renamed} 个目录并按新路径重建，无需再手动扫描`,
+          : `已重命名 ${res.renamed} 个目录并按新路径重建；已登记写任务 #${res.jobId}，可在下方「写操作记录」撤销`,
         res.failed > 0,
       );
       loadStats();
@@ -3588,6 +3593,7 @@ async function removeCover() {
 const JOB_LABELS = {
   metadata: '写入标签', 'cover-embedded': '写入内嵌封面', 'cover-folder': '写入目录封面',
   'cover-mixed': '封面任务', undo: '撤销还原',
+  rj_refill: '目录补RJ号（重命名）',
 };
 
 let jobTimer = null;
@@ -3650,7 +3656,7 @@ async function pollJob(jobId) {
 async function undoJob(jobId) {
   try {
     const res = await api(`/api/jobs/${jobId}/undo`, { method: 'POST', body: {} });
-    toast(`已撤销：还原 ${res.restored} 个文件${res.failed ? `，${res.failed} 个失败` : ''}`);
+    toast(`已撤销：还原 ${res.restored} ${res.unit ?? '个文件'}${res.failed ? `，${res.failed} 个失败` : ''}`);
     $('#jobBar').hidden = true;
     await refreshCurrent();
     // 撤销的如果是封面任务，抽屉里的勾选状态要跟着回到撤销前的真实情况

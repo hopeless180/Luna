@@ -164,14 +164,14 @@ app.get('/api/stats', (req, res) => {
  * 判定与边界见 server/refill-rj.mjs 头注释。
  */
 app.post('/api/experimental/refill-rj/plan', asyncRoute(async (req, res) => {
-  res.json(refillRj.planRefill());
+  res.json(refillRj.planRefill({ libraryId: parseId(req.body?.libraryId) }));
 }));
 
 app.post('/api/experimental/refill-rj/apply', asyncRoute(async (req, res) => {
   const albumIds = (Array.isArray(req.body?.albumIds) ? req.body.albumIds : [])
     .map(Number).filter((n) => Number.isInteger(n) && n > 0);
   if (!albumIds.length) return badRequest(res, '未选择要回填的目录');
-  res.json(await refillRj.applyRefill(albumIds));
+  res.json(await refillRj.applyRefill(albumIds, { libraryId: parseId(req.body?.libraryId) }));
 }));
 
 /* ---------------------------------------------------------------- libraries */
@@ -1457,6 +1457,11 @@ app.get('/api/jobs/:id', (req, res) => {
 
 app.post('/api/jobs/:id/undo', asyncRoute(async (req, res) => {
   try {
+    const job = writeJobs.getJob(req.params.id);
+    if (job && job.type === 'rj_refill') {
+      const result = await refillRj.undoRefillJob(req.params.id);
+      return res.json({ ok: true, ...result });
+    }
     const result = await writeJobs.undoJob(req.params.id);
     res.json({ ok: true, ...result });
   } catch (err) {

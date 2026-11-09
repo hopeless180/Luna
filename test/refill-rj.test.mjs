@@ -146,6 +146,24 @@ test('索引缺失时 plan 如实报告、不抛错', () => {
 
 /* ----------------------------------------------------------------- apply */
 
+test('plan：可按音乐库过滤——只列所选库之下的发行', () => {
+  const lib2 = path.join(root, 'Music', 'ASMR2');
+  fs.mkdirSync(lib2, { recursive: true });
+  store.addLibrary(lib2);
+  const inLib2 = path.join(lib2, '选库作品');
+  fs.mkdirSync(inLib2, { recursive: true });
+  const otherId = store.upsertVoiceAlbum({ releaseRoot: inLib2, title: '唯一命中作品' });
+  const lib1Id = store.findLibraryByPath(asmrLib).id;
+
+  const all = refill.planRefill();
+  assert.ok(all.items.some((it) => it.album_id === otherId), '全选时应包含两个库的候选');
+
+  const only1 = refill.planRefill({ libraryId: lib1Id });
+  assert.ok(!only1.items.some((it) => it.album_id === otherId), '选库一不该看到库二的候选');
+  const only2 = refill.planRefill({ libraryId: store.findLibraryByPath(lib2).id });
+  assert.ok(only2.items.some((it) => it.album_id === otherId), '选库二应看到自己的候选');
+});
+
 test('apply：重命名目录 → 旧记录删除 → 重扫后按路径识别出 RJ 并由索引补齐社团/声优', async () => {
   const { id, dir } = makeAlbum({ folder: '端到端作品', title: '唯一命中作品', withAudio: true });
   const item = refill.planRefill().items.find((it) => it.album_id === id);
@@ -154,6 +172,7 @@ test('apply：重命名目录 → 旧记录删除 → 重扫后按路径识别�
   const res = await refill.applyRefill([id]);
   assert.equal(res.renamed, 1, `应当改名成功：${JSON.stringify(res.details.failed)}`);
   assert.equal(res.failed, 0);
+  assert.ok(Number.isInteger(res.jobId), '应登记写任务');
 
   // 磁盘：旧名消失、新名存在
   assert.ok(!fs.existsSync(dir), '旧目录名应当不存在了');
@@ -172,6 +191,36 @@ test('apply：重命名目录 → 旧记录删除 → 重扫后按路径识别�
   assert.equal(rebuilt.kind, 'voice');
 });
 
+test('apply：写任务落进 write_jobs，撤销后目录名还原、索引重建、状态 undone', async () => {
+  const { id, dir } = makeAlbum({ folder: '可撤销作品', title: '带【装饰】作品-バイノーラル', withAudio: true });
+  const res = await refill.applyRefill([id]);
+  assert.equal(res.renamed, 1);
+  const newPath = `${dir}【RJ04040404】`;
+
+  // 写操作记录：type、状态、条目「新路径 + backup_file=旧路径」
+  const job = store.db.prepare('SELECT * FROM write_jobs WHERE id = ?').get(res.jobId);
+  assert.equal(job.type, 'rj_refill');
+  assert.equal(job.status, 'done');
+  assert.equal(job.succeeded, 1);
+  const jobItem = store.db.prepare('SELECT * FROM write_job_items WHERE job_id = ?').get(res.jobId);
+  assert.equal(jobItem.path, newPath);
+  assert.equal(jobItem.backup_file, dir);
+  assert.equal(jobItem.status, 'done');
+
+  // 撤销：目录名还原 + 按原路径重建（原路径没有 RJ → rj_code 回到空，功能可再跑）
+  const undo = await refill.undoRefillJob(res.jobId);
+  assert.equal(undo.restored, 1, `撤销应成功：${JSON.stringify(undo)}`);
+  assert.ok(!fs.existsSync(newPath), '新目录名应当改回去了');
+  assert.ok(fs.existsSync(dir), '原目录名应当恢复');
+  const undoneAlbum = store.findVoiceAlbum(dir);
+  assert.ok(undoneAlbum, '撤销后应按原路径重建索引');
+  assert.equal(undoneAlbum.rj_code, null, '原目录名没有 RJ，识别回到原点');
+  assert.equal(store.db.prepare('SELECT status FROM write_jobs WHERE id = ?').get(res.jobId).status, 'undone');
+
+  // 已撤销的任务不能二次撤销
+  await assert.rejects(() => refill.undoRefillJob(res.jobId), /已撤销/);
+});
+
 test('apply：不在候选里的 id 不会被动盘', async () => {
   const { dir } = makeAlbum({ folder: '没在候选里', title: '索引里没有这个标题' });
   const plan = refill.planRefill();
@@ -180,5 +229,24 @@ test('apply：不在候选里的 id 不会被动盘', async () => {
   const res = await refill.applyRefill([notPlanned.album_id]);
   assert.equal(res.renamed, 0);
   assert.equal(res.failed, 0);
+  assert.equal(res.jobId, null, '没做任何事就不该登记写任务');
   assert.ok(fs.existsSync(dir), '磁盘目录必须原样保留');
+});
+
+test('撤销落空：原路径已有同名目录时绝不覆盖', async () => {
+  const { id, dir } = makeAlbum({ folder: '撞车作品', title: '唯一命中作品', withAudio: true });
+  const res = await refill.applyRefill([id]);
+  assert.equal(res.renamed, 1);
+  const newPath = `${dir}【RJ01010101】`;
+  // 用户在原路径放了新东西（比如手工解包了另一份）
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, '别人的文件.mp3'), Buffer.from('keep-me'));
+
+  const undo = refill.undoRefillJob(res.jobId);
+  await assert.rejects(() => undo, /没有可还原/);
+  assert.ok(fs.existsSync(newPath), '新目录不该被动');
+  assert.equal(fs.readFileSync(path.join(dir, '别人的文件.mp3'), 'utf8'), 'keep-me', '用户的东西不许碰');
+  assert.equal(store.db.prepare('SELECT status FROM write_jobs WHERE id = ?').get(res.jobId).status, 'done',
+    '全部落空时任务保持可撤销，清障后还能再试');
+  assert.match(store.db.prepare("SELECT error FROM write_job_items WHERE job_id = ?").get(res.jobId).error, /原路径已有同名目录/);
 });
