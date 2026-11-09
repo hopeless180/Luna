@@ -151,7 +151,10 @@ app.get('/api/stats', (req, res) => {
   res.json({
     stats: store.getStats(),
     completeness: completeness.incompleteSummary(),
-    libraries: store.listLibraries(),
+    // 带库类别（与 /api/libraries 同一判定），统计页「补RJ号」弹窗据此标注
+    libraries: store.listLibraries().map((l) => ({
+      ...l, kind: isUnderAsmrFolder(l.path) ? 'voice' : 'music',
+    })),
     lastBackupAt: assets.lastBackupAt(),
   });
 });

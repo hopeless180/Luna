@@ -2051,10 +2051,6 @@ async function loadStats() {
           <button class="btn" id="gcCoversBtn">回收无用封面</button>
           <button class="btn" id="pruneMissingBtn">清理失效索引</button>
           <button class="btn" id="clearThumbsBtn">清理缩略图缓存</button>
-          <select id="refillRjLib" class="btn" title="「补RJ号」只处理这个音乐库；选「全部音乐库」则处理整个库" style="max-width:150px">
-            <option value="">全部音乐库</option>
-            ${(libraries ?? []).map((l) => `<option value="${l.id}">${esc(l.display_name ?? l.path)}</option>`).join('')}
-          </select>
           <button class="btn" id="refillRjBtn" title="实验功能：按 DLsite 索引把缺号音声目录改名补【RJ号】；旧入库记录会删除并按新目录名重建">补RJ号（实验）</button>
         </div>
       </div>
@@ -2119,59 +2115,135 @@ async function loadStats() {
     }
   });
 
-  $('#refillRjBtn')?.addEventListener('click', async () => {
-    const btn = $('#refillRjBtn');
-    const libraryId = Number($('#refillRjLib')?.value ?? '') || null;
-    btn.disabled = true;
-    try {
-      // 第一步：只读预览（可反复看，不落任何改动）
-      const plan = await api('/api/experimental/refill-rj/plan', { method: 'POST', body: { libraryId } });
-      if (!plan.index.available) {
-        toast('没有可用的 DLsite 索引（Dlsite/rj_index.sqlite3），无法比对', true);
-        return;
-      }
-      if (!plan.items.length) {
-        toast(`扫描了 ${plan.checked} 张缺号发行：没有能唯一匹配到 RJ 号的目录`);
-        return;
-      }
-      const preview = plan.items.slice(0, 6)
-        .map((it) => `${it.folder} → 【${it.rj}】（${it.how}）`)
-        .join('\n');
-      const more = plan.items.length > 6 ? `\n…共 ${plan.items.length} 个` : '';
-      const warn = '\n\n注意：这些专辑的旧入库记录（标签、收藏）会删除，按新目录名重建。';
-      const textEl = $('#confirmText');
-      textEl.style.whiteSpace = 'pre-line';
-      let ok = false;
-      try {
-        ok = await askConfirm({
-          title: `目录名补【RJ号】：${plan.items.length} 个`,
-          text: `${preview}${more}${warn}`,
-          okLabel: '重命名并重建',
-          danger: true,
-        });
-      } finally {
-        textEl.style.whiteSpace = '';
-      }
-      if (!ok) return;
-      // 第二步：真正动盘（服务端会重新核对一遍，陈旧预览自动落空）
-      const res = await api('/api/experimental/refill-rj/apply', {
-        method: 'POST',
-        body: { albumIds: plan.items.map((it) => it.album_id), libraryId },
-      });
-      const fails = res.details?.failed ?? [];
-      toast(
-        res.failed
-          ? `已重命名 ${res.renamed} 个，失败 ${res.failed} 个：${fails.map((f) => `${f.folder}（${f.reason}）`).join('；')}`
-          : `已重命名 ${res.renamed} 个目录并按新路径重建；已登记写任务 #${res.jobId}，可在下方「写操作记录」撤销`,
-        res.failed > 0,
-      );
-      loadStats();
-    } catch (err) {
-      toast(`补 RJ 号失败：${err.message}`, true);
-    } finally {
-      btn.disabled = false;
+  $('#refillRjBtn')?.addEventListener('click', () => openRefillRjDialog(libraries));
+}
+
+/* ========================================== 实验弹窗：目录名补【RJ号】 */
+
+/*
+ * 三步都在这一颗悬浮窗里完成：选库 → 只读匹配预览（逐条可勾）→ 危险按钮执行。
+ * apply 由服务端重新核对一遍，陈旧预览自动落空；写任务登记后可在「写操作记录」撤销。
+ */
+const refillDlg = { libraryId: null, busy: false };
+
+function refillSkipSummary(skipped) {
+  const list = skipped ?? [];
+  if (!list.length) return '';
+  const head = list.slice(0, 8).map((s) => `${s.folder}（${s.reason}）`).join('；');
+  return `<p class="hint" style="margin-top:8px;opacity:.8">未补齐 ${list.length}：${head}${list.length > 8 ? '；…' : ''}</p>`;
+}
+
+function openRefillRjDialog(libraries) {
+  refillDlg.libraryId = null;
+  refillDlg.busy = false;
+  const body = $('#refillRjDlgBody');
+  const err = $('#refillRjDlgError');
+  err.hidden = true;
+  body.innerHTML = `
+    <p class="hint" style="margin:6px 0 4px">选择要操作的库：</p>
+    <label style="display:flex;gap:8px;align-items:center;padding:5px 2px">
+      <input type="radio" name="refillRjLibPick" value="" checked />
+      <span>全部音乐库</span><span class="hint">（含音声发行的库都参与匹配）</span>
+    </label>
+    ${(libraries ?? []).map((l) => `
+      <label style="display:flex;gap:8px;align-items:center;padding:5px 2px">
+        <input type="radio" name="refillRjLibPick" value="${l.id}" />
+        <span>${esc(l.display_name ?? l.path)}</span>
+        <span class="hint">（${l.track_count ?? 0} 曲 · ${l.kind === 'voice' ? '音声' : '普通'}）</span>
+      </label>`).join('')}`;
+  refillDlgSetGo('开始匹配', 'btn btn-primary', () => refillDlgMatch());
+  $('#refillRjDlgCancel').textContent = '取消';
+  $('#refillRjDlgCancel').onclick = () => $('#refillRjDialog').close();
+  $('#refillRjDialog').showModal();
+}
+
+function refillDlgSetGo(label, cls, onclick) {
+  const go = $('#refillRjDlgGo');
+  go.textContent = label;
+  go.className = cls;
+  go.disabled = false;
+  go.onclick = onclick;
+}
+
+async function refillDlgMatch() {
+  if (refillDlg.busy) return;
+  refillDlg.busy = true;
+  const go = $('#refillRjDlgGo');
+  const err = $('#refillRjDlgError');
+  const body = $('#refillRjDlgBody');
+  err.hidden = true;
+  const picked = document.querySelector('input[name="refillRjLibPick"]:checked');
+  refillDlg.libraryId = picked && picked.value ? Number(picked.value) : null;
+  go.disabled = true;
+  go.textContent = '匹配中…';
+  try {
+    const plan = await api('/api/experimental/refill-rj/plan', { method: 'POST', body: { libraryId: refillDlg.libraryId } });
+    if (!plan.index.available) {
+      err.textContent = '没有可用的 DLsite 索引（Dlsite/rj_index.sqlite3），无法比对';
+      err.hidden = false;
+      refillDlgSetGo('开始匹配', 'btn btn-primary', () => refillDlgMatch());
+      return;
     }
-  });
+    if (!plan.items.length) {
+      body.innerHTML = `<p class="hint" style="margin-top:8px">扫描了 ${plan.checked} 张缺号发行：没有能唯一匹配到 RJ 号的目录。</p>${refillSkipSummary(plan.skipped)}`;
+      refillDlgSetGo('关闭', 'btn btn-primary', () => $('#refillRjDialog').close());
+      return;
+    }
+    body.innerHTML = `
+      <p class="hint" style="margin:8px 0 4px">可补 <b>${plan.items.length}</b> 个（勾选要执行的）：</p>
+      ${plan.items.map((it) => `
+        <label style="display:flex;gap:8px;align-items:center;padding:4px 2px">
+          <input type="checkbox" checked data-refill-id="${it.album_id}" />
+          <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+                title="${esc(it.old_path)}">${esc(it.folder)} <b>→【${esc(it.rj)}】</b></span>
+          <span class="hint">${esc(it.how)}</span>
+        </label>`).join('')}
+      ${refillSkipSummary(plan.skipped)}
+      <p class="hint" style="margin-top:8px;color:var(--danger,#e57373)">
+        执行后这些专辑的旧入库记录（标签、收藏）会删除并按新目录名重建；社团/声优会按索引重新补齐。
+        改名本身可在下方「写操作记录」撤销。</p>`;
+    refillDlgSetGo(`重命名所选 ${plan.items.length} 个`, 'btn btn-danger', () => refillDlgApply());
+  } catch (e) {
+    err.textContent = `匹配失败：${e.message}`;
+    err.hidden = false;
+    refillDlgSetGo('开始匹配', 'btn btn-primary', () => refillDlgMatch());
+  } finally {
+    refillDlg.busy = false;
+  }
+}
+
+async function refillDlgApply() {
+  if (refillDlg.busy) return;
+  const ids = $$('#refillRjDlgBody [data-refill-id]')
+    .filter((el) => el.checked)
+    .map((el) => Number(el.dataset.refillId));
+  if (!ids.length) { toast('没有勾选任何目录', true); return; }
+  refillDlg.busy = true;
+  const go = $('#refillRjDlgGo');
+  go.disabled = true;
+  go.textContent = '执行中…';
+  try {
+    const res = await api('/api/experimental/refill-rj/apply', {
+      method: 'POST', body: { albumIds: ids, libraryId: refillDlg.libraryId },
+    });
+    const fails = res.details?.failed ?? [];
+    toast(
+      res.failed
+        ? `已重命名 ${res.renamed} 个，失败 ${res.failed} 个：${fails.map((f) => `${f.folder}（${f.reason}）`).join('；')}`
+        : `已重命名 ${res.renamed} 个目录；写任务 #${res.jobId} 已登记，可在「写操作记录」撤销`,
+      res.failed > 0,
+    );
+    $('#refillRjDialog').close();
+    loadStats();
+  } catch (err) {
+    toast(`补 RJ 号失败：${err.message}`, true);
+    const back = $$('#refillRjDlgBody [data-refill-id]').length
+      ? () => refillDlgApply()
+      : () => refillDlgMatch();
+    refillDlgSetGo('重试执行', 'btn btn-danger', back);
+  } finally {
+    refillDlg.busy = false;
+  }
 }
 
 /* ============================================================ 标签弹窗 */

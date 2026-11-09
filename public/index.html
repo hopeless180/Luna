@@ -320,6 +320,21 @@
   </div>
 </div>
 
+<!-- 实验功能：目录名末尾补【RJ号】（选库 → 预览 → 执行，流程见 app.js 的 openRefillRjDialog） -->
+<dialog class="dlg" id="refillRjDialog">
+  <form method="dialog">
+    <h3>目录名补【RJ号】（实验）</h3>
+    <p class="hint">按 DLsite 索引标题反查，只列能**唯一命中**的目录；查不到、有歧义的一律不猜。</p>
+    <div id="refillRjDlgBody"></div>
+    <div class="dlg-actions">
+      <span class="spacer"></span>
+      <button class="btn btn-ghost" type="button" id="refillRjDlgCancel">取消</button>
+      <button class="btn btn-primary" type="button" id="refillRjDlgGo">开始匹配</button>
+    </div>
+    <div class="dlg-error" id="refillRjDlgError" hidden></div>
+  </form>
+</dialog>
+
 <!-- 通用确认框（替代 Electron 不支持的 window.confirm） -->
 <dialog class="dlg dlg-narrow" id="confirmDialog">
   <form method="dialog">
