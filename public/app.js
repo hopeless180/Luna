@@ -2153,7 +2153,10 @@ function refillRowsOf(plan) {
   }
   for (const s of plan.skipped ?? []) {
     const conflict = /目标目录名已存在|路径过长|目录被占用/.test(s.reason);
-    rows.push({ kind: conflict ? 'conflict' : 'nomatch', id: s.album_id, folder: s.folder, reason: s.reason });
+    rows.push({
+      kind: conflict ? 'conflict' : 'nomatch', id: s.album_id, folder: s.folder,
+      reason: s.reason, oldPath: s.old_path ?? null, newPath: s.new_path ?? null,
+    });
   }
   return rows;
 }
@@ -2208,6 +2211,13 @@ function refillScoreBar(selectedPct, topPct) {
     + `<span class="rf-score ${cls}">${pct}%</span>`;
 }
 
+/** 「定位」：在资源管理器中选中目录（虚拟路径/无路径时不显示） */
+function refillRevealBtn(path) {
+  const p = String(path ?? '');
+  if (!p || p.includes('\u0001') || p.includes('\u0000')) return '<span class="rf-reason">—</span>';
+  return `<button class="rf-op" type="button" data-reveal="${esc(p)}" title="在资源管理器中显示">定位</button>`;
+}
+
 function refillRowMarkup(row) {
   if (row.kind === 'auto') {
     const checked = refillDlg.checked.has(row.id) ? 'checked' : '';
@@ -2220,7 +2230,7 @@ function refillRowMarkup(row) {
             <span class="rf-match-rj">→【${esc(row.rj)}】</span>
             <div class="rf-reason">${esc(row.how)}</div></td>
         <td>${refillScoreBar(100, 100)}</td>
-        <td class="rf-col-op"><button class="rf-op" type="button" data-skip="${row.id}">排除</button></td>
+        <td class="rf-col-op">${refillRevealBtn(row.oldPath)}</td>
       </tr>`;
   }
   if (row.kind === 'review') {
@@ -2238,17 +2248,21 @@ function refillRowMarkup(row) {
         <td><span class="rf-dot is-warn">待确认</span></td>
         <td>
           <select class="rf-select" data-choose="${row.id}">
-            ${row.candidates.map((c) => `
-              <option value="${esc(c.rj)}" data-score="${Math.round(c.score * 100)}"
-                      ${picked === c.rj ? 'selected' : ''}>
-                ${Math.round(c.score * 100)}% ｜ ${esc(c.rj)} · ${esc(c.circle ?? '未知社团')} · ${esc(String(c.title ?? '').slice(0, 46))}
-              </option>`).join('')}
+            <option value="" disabled>原名：${esc(row.folder)}</option>
+            ${row.candidates.map((c) => {
+              const pct = Math.round(c.score * 100);
+              const pad = String(pct).padStart(3, '\u00A0');
+              return `
+              <option value="${esc(c.rj)}" data-score="${pct}" ${picked === c.rj ? 'selected' : ''}>
+                ${pad}% ｜ ${esc(c.rj)} · ${esc(c.circle ?? '未知社团')} · ${esc(String(c.title ?? '').slice(0, 46))}
+              </option>`;
+            }).join('')}
             <option value="" data-score="" ${picked ? '' : 'selected'}>保留原名（不补）</option>
           </select>
           ${row.hint ? `<div class="rf-reason">${esc(row.hint)}</div>` : ''}
         </td>
         <td data-score-cell="${row.id}">${refillScoreBar(pickedPct, topPct)}</td>
-        <td class="rf-col-op"><button class="rf-op" type="button" data-reset="${row.id}">保留原名</button></td>
+        <td class="rf-col-op">${refillRevealBtn(row.oldPath)}</td>
       </tr>`;
   }
   const conflict = row.kind === 'conflict';
@@ -2259,7 +2273,7 @@ function refillRowMarkup(row) {
       <td>${conflict ? '<span class="rf-dot is-danger">冲突</span>' : '<span class="rf-dot is-faint">无匹配</span>'}</td>
       <td><span class="rf-reason">${esc(row.reason ?? '')}</span></td>
       <td><span class="rf-score is-low">—</span></td>
-      <td class="rf-col-op"><span class="rf-reason">—</span></td>
+      <td class="rf-col-op">${refillRevealBtn(conflict ? (row.newPath || row.oldPath) : row.oldPath)}</td>
     </tr>`;
 }
 
@@ -2325,7 +2339,10 @@ function openRefillRjDialog(libraries) {
   cancelBtn.onclick = () => $('#refillRjDialog').close();
   // 执行中按 Esc 不允许直接关掉（防止误以为已停止；要退出得先点「停止执行」）
   $('#refillRjDialog').oncancel = (e) => { if (refillDlg.busy) e.preventDefault(); };
-  $('#refillRjDlgGo').onclick = () => refillDlgApply();
+  // 复位主按钮：上轮执行完会把它改成「关闭」，重开时必须回到「执行补全」
+  const go = $('#refillRjDlgGo');
+  go.textContent = '执行补全';
+  go.onclick = () => refillDlgApply();
   $('#refillRjSearch').oninput = (e) => { refillDlg.query = e.target.value; renderRefillTable(); };
   $('#refillRjThreshold').oninput = (e) => {
     refillDlg.threshold = Number(e.target.value) || 55;
@@ -2359,7 +2376,8 @@ function openRefillRjDialog(libraries) {
       if (cell) {
         const opt = choose.selectedOptions[0];
         const chosenPct = choose.value && opt?.dataset.score ? Number(opt.dataset.score) : null;
-        const first = choose.options[0];
+        // 第一项是「原名」对照（disabled），第二项起才是候选
+        const first = choose.options[1];
         const topPct = first?.dataset.score ? Number(first.dataset.score) : null;
         cell.innerHTML = refillScoreBar(chosenPct, topPct);
       }
@@ -2367,30 +2385,10 @@ function openRefillRjDialog(libraries) {
     }
   };
   tbody.onclick = (e) => {
-    const skip = e.target.closest('[data-skip]');
-    if (skip) {
-      const id = Number(skip.dataset.skip);
-      refillDlg.checked.delete(id);
-      const box = tbody.querySelector(`[data-pick="${id}"]`);
-      if (box) box.checked = false;
-      updateRefillFooter();
-      return;
-    }
-    const reset = e.target.closest('[data-reset]');
-    if (reset) {
-      const id = Number(reset.dataset.reset);
-      refillDlg.choices.delete(id);
-      const select = tbody.querySelector(`[data-choose="${id}"]`);
-      if (select) {
-        select.value = '';
-        const cell = tbody.querySelector(`[data-score-cell="${id}"]`);
-        if (cell) {
-          const topPct = select.options[0]?.dataset.score ? Number(select.options[0].dataset.score) : null;
-          cell.innerHTML = refillScoreBar(null, topPct);
-        }
-      }
-      updateRefillFooter();
-    }
+    const reveal = e.target.closest('[data-reveal]');
+    if (!reveal) return;
+    api('/api/reveal', { method: 'POST', body: { path: reveal.dataset.reveal } })
+      .catch((err) => toast(`打开文件夹失败：${err.message}`, true));
   };
 
   $('#refillRjSummary').innerHTML = '<span>正在比对 DLsite 索引…</span>';
@@ -2417,6 +2415,8 @@ async function refillDlgMatch() {
   $('#refillRjProgress').hidden = true;
   $('#refillRjProgress').innerHTML = '';
   document.querySelector('#refillRjDialog .rf-toolbar').style.visibility = '';
+  go.textContent = '执行补全';
+  go.onclick = () => refillDlgApply();
   refillDlg.libraryId = Number($('#refillRjLib').value || 0) || null;
   $('#refillRjSummary').innerHTML = '<span>正在比对 DLsite 索引…</span>';
   $('#refillRjTbody').innerHTML = '';

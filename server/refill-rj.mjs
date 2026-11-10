@@ -94,10 +94,12 @@ export function planRefill({ libraryId = null } = {}) {
   const items = [];
   const review = [];
   const skipped = [];
-  const note = (album, reason) => skipped.push({
+  const note = (album, reason, extra = {}) => skipped.push({
     album_id: album.id,
     folder: path.basename(String(album.release_root ?? '')) || String(album.title ?? album.id),
     reason,
+    old_path: String(album.release_root ?? '') || null,
+    ...extra,
   });
   let checked = 0;
 
@@ -142,8 +144,8 @@ export function planRefill({ libraryId = null } = {}) {
     const newPath = `${root}【${hit.work.rj}】`;
     let clash = false;
     try { clash = fs.existsSync(newPath); } catch { clash = true; }
-    if (clash) { note(album, `目标目录名已存在（${hit.work.rj}）`); continue; }
-    if (newPath.length > MAX_NEW_PATH) { note(album, `重命名后路径过长（${newPath.length} 字符）`); continue; }
+    if (clash) { note(album, `目标目录名已存在（${hit.work.rj}）`, { new_path: newPath }); continue; }
+    if (newPath.length > MAX_NEW_PATH) { note(album, `重命名后路径过长（${newPath.length} 字符）`, { new_path: newPath }); continue; }
 
     items.push({
       album_id: album.id,
