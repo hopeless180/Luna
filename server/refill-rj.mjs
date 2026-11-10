@@ -177,8 +177,24 @@ function nearCandidates({ title, folder }) {
   return [...byRj.values()].sort((a, b) => b.score - a.score).slice(0, 5);
 }
 
+/* ---------------------------------------------------- 执行（后台任务，可看进度） */
+
+/*
+ * apply 不再一口气跑完再返回：建好任务与条目（全部 pending）后**立即返回 jobId**，
+ * 后台逐条把条目推进 pending → running → done/failed（write_jobs.succeeded/failed 同步刷新），
+ * 前端轮询 /api/jobs/:id 就能看到「等待中 / 正在修改 / 完成 / 失败」的实时进度。
+ */
+
+let applying = false;
+let applyPromise = null;
+
+export function isApplying() { return applying; }
+
+/** 等当前补全任务跑完（测试与维护用） */
+export function awaitRefillIdle() { return applyPromise ?? Promise.resolve(); }
+
 /**
- * 执行重命名（破坏性，用户已确认）：登记写任务 → 改名 → 删旧记录 → 按新路径重扫入库。
+ * 执行重命名（破坏性，用户已确认）：登记写任务 → 后台逐条 改名 → 删旧记录 → 按新路径重扫入库。
  * `albumIds` 必须来自**同一批预览**；这里会重新 plan 一次再按 id 过滤，
  * 磁盘或索引在预览后变了的话，对不上的条目自动落空，绝不按陈旧预览硬改。
  * `choices`（{album_id: rj}）来自近似候选的人工点选：服务端拿**刚算出的候选**核对，
@@ -187,6 +203,7 @@ function nearCandidates({ title, folder }) {
 export async function applyRefill(albumIds, { libraryId = null, choices = {} } = {}) {
   if (isScanning()) throw new Error('扫描正在进行，请先结束扫描再执行回填');
   if (isWriting()) throw new Error('正在写回文件，请等写入结束后再执行回填');
+  if (applying) throw new Error('已有一次补全正在执行，请等它结束');
   const wanted = new Set((albumIds ?? []).map(Number).filter(Number.isFinite));
   const fresh = planRefill({ libraryId });
   const plan = fresh.items.filter((it) => wanted.has(it.album_id));
@@ -222,57 +239,85 @@ export async function applyRefill(albumIds, { libraryId = null, choices = {} } =
       new_path: newPath,
     });
   }
-  // 自动候选 + 人工确认候选合并（同一专辑两者只会有一种）
-  for (const it of picked.values()) plan.push(it);
-  if (!plan.length) {
-    return { jobId: null, renamed: 0, failed: chosenFailed.length, details: { renamed: [], failed: chosenFailed } };
+  // 自动候选 + 人工确认候选合并（同一专辑两者只会有一种）；校验失败的也进进度表（直接标失败）
+  const entries = [...plan, ...picked.values()].map((it) => ({ ...it, presetError: null }));
+  for (const f of chosenFailed) {
+    entries.push({
+      album_id: f.album_id, folder: f.folder, rj: f.rj, how: '人工确认候选校验失败',
+      work_title: null, work_circle: null, library_id: null,
+      old_path: null, new_path: null, presetError: f.reason,
+    });
   }
+  if (!entries.length) return { jobId: null, queued: 0 };
 
   const jobInfo = db.prepare(`
     INSERT INTO write_jobs (type, status, payload_json, total, created_at)
     VALUES (?, 'running', ?, ?, ?)
-  `).run(JOB_TYPE, JSON.stringify({ items: plan }), plan.length, now());
+  `).run(JOB_TYPE, JSON.stringify({ items: entries }), entries.length, now());
   const jobId = Number(jobInfo.lastInsertRowid);
   const insItem = db.prepare(`
     INSERT INTO write_job_items (job_id, track_id, path, status) VALUES (?, NULL, ?, 'pending')
   `);
-  // item 顺序 = plan 顺序；撤销时按同一顺序对照 payload.items 取 library_id
-  const itemIds = plan.map((it) => Number(insItem.run(jobId, it.new_path).lastInsertRowid));
-  const setItem = db.prepare(
-    'UPDATE write_job_items SET status = ?, error = ?, backup_file = ? WHERE id = ?',
-  );
+  // 条目顺序 = payload.items 顺序；撤销时按同一顺序对照 payload.items 取 library_id
+  const itemIds = entries.map((e) => Number(
+    insItem.run(jobId, e.new_path ?? e.folder ?? String(e.album_id)).lastInsertRowid,
+  ));
 
-  const renamed = [];
-  const failed = chosenFailed.slice(); // 人工选择失效的条目一并如实汇报
-  for (let i = 0; i < plan.length; i += 1) {
-    const it = plan[i];
+  applying = true;
+  applyPromise = processRefillJob(jobId, entries, itemIds)
+    .catch((err) => {
+      db.prepare("UPDATE write_jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?")
+        .run(now(), String(err.message ?? err), jobId);
+    })
+    .finally(() => {
+      applying = false;
+      applyPromise = null;
+    });
+  return { jobId, queued: entries.length };
+}
+
+/** 后台逐条推进任务；每一步都落库，前端轮询即可看到进度 */
+async function processRefillJob(jobId, entries, itemIds) {
+  const item = db.prepare('UPDATE write_job_items SET status = ?, error = ?, backup_file = ? WHERE id = ?');
+  const counts = db.prepare('UPDATE write_jobs SET status = ?, succeeded = ?, skipped = 0, failed = ? WHERE id = ?');
+  let ok = 0;
+  let bad = 0;
+  for (let i = 0; i < entries.length; i += 1) {
+    const it = entries[i];
+    if (it.presetError) {
+      bad += 1;
+      item.run('failed', it.presetError, null, itemIds[i]);
+      counts.run('running', ok, bad, jobId);
+      continue;
+    }
+    item.run('running', null, null, itemIds[i]);
     try {
       fs.renameSync(it.old_path, it.new_path);
     } catch (err) {
       const reason = (err.code === 'EPERM' || err.code === 'EBUSY')
         ? '目录被占用或没有权限（正在播放或资源管理器打开了它？）'
         : `${err.code ?? '错误'}：${err.message}`;
-      setItem.run('failed', reason, null, itemIds[i]);
-      failed.push({ ...it, reason });
+      bad += 1;
+      item.run('failed', reason, null, itemIds[i]);
+      counts.run('running', ok, bad, jobId);
       continue;
     }
     // 改名成功即刻登记「还原点」（backup_file=旧路径）；重建属于后续步骤
-    setItem.run('done', null, it.old_path, itemIds[i]);
+    let warning = null;
     try {
       store.deleteAlbumDeep(it.album_id);
       await rescanReleaseRoot({ releaseRoot: it.new_path, libraryId: it.library_id });
-      renamed.push(it);
     } catch (err) {
-      renamed.push({ ...it, rescan: `failed: ${err.message}（下次扫描会自动重建）` });
+      warning = `索引重建失败：${err.message}（下次扫描会自动重建）`;
     }
+    ok += 1;
+    item.run('done', warning, it.old_path, itemIds[i]);
+    counts.run('running', ok, bad, jobId);
   }
-
   db.prepare(`
-    UPDATE write_jobs
-    SET status = 'done', finished_at = ?, succeeded = ?, skipped = 0, failed = ?
+    UPDATE write_jobs SET status = 'done', finished_at = ?, succeeded = ?, skipped = 0, failed = ?
     WHERE id = ?
-  `).run(now(), renamed.length, failed.length, jobId);
-  return { jobId, renamed: renamed.length, failed: failed.length, details: { renamed, failed } };
+  `).run(now(), ok, bad, jobId);
 }
 
 /**
@@ -283,6 +328,7 @@ export async function applyRefill(albumIds, { libraryId = null, choices = {} } =
 export async function undoRefillJob(jobId) {
   if (isScanning()) throw new Error('扫描正在进行，请先结束扫描');
   if (isWriting()) throw new Error('正在写回文件，请等写入结束');
+  if (applying) throw new Error('补全任务正在执行，请等它结束再撤销');
   const job = db.prepare('SELECT * FROM write_jobs WHERE id = ?').get(Number(jobId));
   if (!job || job.type !== JOB_TYPE) throw new Error('这不是「补RJ号」写任务');
   if (job.status === 'undone') throw new Error('该任务已撤销过');

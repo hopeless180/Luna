@@ -150,18 +150,38 @@ test('apply：只点选确认区里的合法候选才改名；不在最新候选
 
   // 先试一个不在候选里的 RJ（模拟陈旧/篡改）→ 应落空，不动盘
   const bad = await refill.applyRefill([id], { choices: { [id]: 'RJ99999999' } });
-  assert.equal(bad.renamed, 0);
-  assert.equal(bad.failed, 1);
-  assert.match(bad.details.failed[0].reason, /不在最新候选/);
+  assert.equal(bad.queued, 1);
+  await refill.awaitRefillIdle();
+  const badJob = store.db.prepare('SELECT * FROM write_jobs WHERE id = ?').get(bad.jobId);
+  assert.equal(badJob.succeeded, 0);
+  assert.equal(badJob.failed, 1);
+  const badItem = store.db.prepare('SELECT * FROM write_job_items WHERE job_id = ?').get(bad.jobId);
+  assert.match(badItem.error, /不在最新候选/);
   assert.ok(fs.existsSync(dir), '非法选择不能改名');
 
-  // 用候选里真实的第一名 → 成功，how 标注人工确认
+  // 用候选里真实的第一名 → 成功，payload 的 how 标注人工确认
   const chosen = rv.candidates[0].rj;
   const ok = await refill.applyRefill([id], { choices: { [id]: chosen } });
-  assert.equal(ok.renamed, 1);
-  assert.equal(ok.details.renamed[0].rj, chosen);
-  assert.match(ok.details.renamed[0].how, /人工确认/);
+  assert.equal(ok.queued, 1);
+  await refill.awaitRefillIdle();
+  const okJob = store.db.prepare('SELECT * FROM write_jobs WHERE id = ?').get(ok.jobId);
+  assert.equal(okJob.succeeded, 1);
+  assert.match(JSON.parse(okJob.payload_json).items[0].how, /人工确认/);
   assert.ok(fs.existsSync(`${dir}【${chosen}】`));
+});
+
+test('apply：后台任务可观察——返回即执行中，awaitRefillIdle 后完成', async () => {
+  const { id } = makeAlbum({ folder: '进度作品', title: '唯一命中作品', withAudio: true });
+  assert.equal(refill.isApplying(), false);
+  const res = await refill.applyRefill([id]);
+  assert.ok(Number.isInteger(res.jobId));
+  assert.equal(res.queued, 1);
+  assert.equal(refill.isApplying(), true, '返回后任务应在后台继续执行');
+  await refill.awaitRefillIdle();
+  assert.equal(refill.isApplying(), false);
+  const job = store.db.prepare('SELECT * FROM write_jobs WHERE id = ?').get(res.jobId);
+  assert.equal(job.status, 'done');
+  assert.equal(job.succeeded, 1);
 });
 
 test('索引缺失时 plan 如实报告、不抛错', () => {
@@ -204,8 +224,12 @@ test('apply：重命名目录 → 旧记录删除 → 重扫后按路径识别�
   assert.ok(item);
 
   const res = await refill.applyRefill([id]);
-  assert.equal(res.renamed, 1, `应当改名成功：${JSON.stringify(res.details.failed)}`);
-  assert.equal(res.failed, 0);
+  assert.equal(res.queued, 1);
+  await refill.awaitRefillIdle();
+  const job = store.db.prepare('SELECT * FROM write_jobs WHERE id = ?').get(res.jobId);
+  assert.equal(job.status, 'done');
+  assert.equal(job.succeeded, 1);
+  assert.equal(job.failed, 0);
   assert.ok(Number.isInteger(res.jobId), '应登记写任务');
 
   // 磁盘：旧名消失、新名存在
@@ -228,7 +252,8 @@ test('apply：重命名目录 → 旧记录删除 → 重扫后按路径识别�
 test('apply：写任务落进 write_jobs，撤销后目录名还原、索引重建、状态 undone', async () => {
   const { id, dir } = makeAlbum({ folder: '可撤销作品', title: '带【装饰】作品-バイノーラル', withAudio: true });
   const res = await refill.applyRefill([id]);
-  assert.equal(res.renamed, 1);
+  assert.equal(res.queued, 1);
+  await refill.awaitRefillIdle();
   const newPath = `${dir}【RJ04040404】`;
 
   // 写操作记录：type、状态、条目「新路径 + backup_file=旧路径」
@@ -261,16 +286,16 @@ test('apply：不在候选里的 id 不会被动盘', async () => {
   const notPlanned = plan.skipped.find((it) => it.folder === '没在候选里');
   assert.ok(notPlanned, '查不到的应当只进 skipped');
   const res = await refill.applyRefill([notPlanned.album_id]);
-  assert.equal(res.renamed, 0);
-  assert.equal(res.failed, 0);
   assert.equal(res.jobId, null, '没做任何事就不该登记写任务');
+  assert.equal(res.queued, 0);
   assert.ok(fs.existsSync(dir), '磁盘目录必须原样保留');
 });
 
 test('撤销落空：原路径已有同名目录时绝不覆盖', async () => {
   const { id, dir } = makeAlbum({ folder: '撞车作品', title: '唯一命中作品', withAudio: true });
   const res = await refill.applyRefill([id]);
-  assert.equal(res.renamed, 1);
+  assert.equal(res.queued, 1);
+  await refill.awaitRefillIdle();
   const newPath = `${dir}【RJ01010101】`;
   // 用户在原路径放了新东西（比如手工解包了另一份）
   fs.mkdirSync(dir, { recursive: true });

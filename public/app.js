@@ -2389,6 +2389,10 @@ function openRefillRjDialog(libraries) {
   $('#refillRjTabs').innerHTML = '';
   $('#refillRjTbody').innerHTML = '';
   $('#refillRjEmpty').hidden = true;
+  $('#refillRjTable').hidden = false;
+  $('#refillRjProgress').hidden = true;
+  $('#refillRjProgress').innerHTML = '';
+  document.querySelector('#refillRjDialog .rf-toolbar').style.visibility = '';
   updateRefillFooter();
   $('#refillRjDialog').showModal();
   refillDlgMatch();
@@ -2400,6 +2404,11 @@ async function refillDlgMatch() {
   const err = $('#refillRjDlgError');
   const go = $('#refillRjDlgGo');
   err.hidden = true;
+  // 从「执行进度」回到比对表格（重新匹配会放弃上一次进度视图）
+  $('#refillRjTable').hidden = false;
+  $('#refillRjProgress').hidden = true;
+  $('#refillRjProgress').innerHTML = '';
+  document.querySelector('#refillRjDialog .rf-toolbar').style.visibility = '';
   refillDlg.libraryId = Number($('#refillRjLib').value || 0) || null;
   $('#refillRjSummary').innerHTML = '<span>正在比对 DLsite 索引…</span>';
   $('#refillRjTbody').innerHTML = '';
@@ -2439,28 +2448,101 @@ async function refillDlgApply() {
   refillDlg.busy = true;
   const go = $('#refillRjDlgGo');
   go.disabled = true;
-  const oldLabel = go.textContent;
-  go.textContent = '执行中…';
   try {
     const res = await api('/api/experimental/refill-rj/apply', {
       method: 'POST', body: { albumIds: ids, libraryId: refillDlg.libraryId, choices },
     });
-    const fails = res.details?.failed ?? [];
-    toast(
-      res.failed
-        ? `已重命名 ${res.renamed} 个，失败 ${res.failed} 个：${fails.map((f) => `${f.folder}（${f.reason}）`).join('；')}`
-        : `已重命名 ${res.renamed} 个目录；写任务 #${res.jobId} 已登记，可在「写操作记录」撤销`,
-      res.failed > 0,
-    );
-    $('#refillRjDialog').close();
-    loadStats();
+    refillWatchJob(res.jobId);
   } catch (err) {
     toast(`补 RJ 号失败：${err.message}`, true);
-    go.textContent = oldLabel;
-    updateRefillFooter();
-  } finally {
     refillDlg.busy = false;
+    updateRefillFooter();
   }
+}
+
+/**
+ * 执行进度视图：轮询 /api/jobs/:id，把每条目录的「等待中 / 正在修改 / 已完成 / 失败」
+ * 实时画在表格位置；失败原因直接显示在该条目下方。结束后按钮变「关闭」，任务仍可在
+ * 「写操作记录」撤销。
+ */
+function refillWatchJob(jobId) {
+  const dialog = $('#refillRjDialog');
+  const progress = $('#refillRjProgress');
+  const table = $('#refillRjTable');
+  const go = $('#refillRjDlgGo');
+  const cancel2 = $('#refillRjDlgCancel2');
+  const toolbar = $('#refillRjDialog .rf-toolbar');
+  const stateClass = { pending: 'is-faint', running: 'is-warn', done: 'is-ok', failed: 'is-danger' };
+  const stateText = { pending: '等待中', running: '正在修改', done: '已完成', failed: '失败' };
+
+  table.hidden = true;
+  $('#refillRjEmpty').hidden = true;
+  progress.hidden = false;
+  progress.innerHTML = '<div class="rf-empty">正在创建任务…</div>';
+  $('#refillRjTabs').innerHTML = '';
+  toolbar.style.visibility = 'hidden';
+  cancel2.disabled = true;
+  go.disabled = true;
+  go.textContent = '执行中…';
+  let finished = false;
+
+  const render = (job) => {
+    const items = job.items ?? [];
+    const entries = job.payload?.items ?? [];
+    const n = (st) => items.filter((it) => it.status === st).length;
+    $('#refillRjSummary').innerHTML = `
+      <span>共 <b>${items.length}</b> 个目录</span>
+      <span class="rf-chip is-faint">等待 <b>${n('pending')}</b></span>
+      <span class="rf-chip is-warn">修改中 <b>${n('running')}</b></span>
+      <span class="rf-chip is-ok">完成 <b>${n('done')}</b></span>
+      <span class="rf-chip is-danger">失败 <b>${n('failed')}</b></span>`;
+    progress.innerHTML = items.map((it, i) => {
+      const e = entries[i] ?? {};
+      const st = stateClass[it.status] ? it.status : 'pending';
+      const err = it.error ? `<div class="rf-prog-error">${esc(it.error)}</div>` : '';
+      return `
+        <div class="rf-prog-row is-${st}">
+          <span class="rf-prog-state"><span class="rf-dot ${stateClass[st]}">${stateText[st]}</span></span>
+          <div class="rf-prog-main">
+            <div class="rf-prog-name" title="${esc(e.old_path ?? e.folder ?? it.path)}">
+              ${esc(e.folder ?? it.path)} <span class="rf-prog-arrow">→【${esc(e.rj ?? '')}】</span>
+            </div>
+            ${err}
+          </div>
+        </div>`;
+    }).join('');
+    $('#refillRjFootInfo').innerHTML = `已完成 <b>${n('done')}</b> / ${items.length}`
+      + (n('failed') ? ` · 失败 <b>${n('failed')}</b>` : '');
+  };
+
+  let ticking = false;
+  const timer = setInterval(async () => {
+    if (ticking) return;
+    if (!dialog.open) { clearInterval(timer); refillDlg.busy = false; return; }
+    ticking = true;
+    try {
+      const { job } = await api(`/api/jobs/${jobId}`);
+      render(job);
+      if (!finished && ['done', 'failed', 'interrupted'].includes(job.status)) {
+        finished = true;
+        clearInterval(timer);
+        refillDlg.busy = false;
+        cancel2.disabled = false;
+        toolbar.style.visibility = '';
+        go.textContent = '关闭';
+        go.disabled = false;
+        go.onclick = () => dialog.close();
+        toast(
+          job.failed
+            ? `补全结束：成功 ${job.succeeded}，失败 ${job.failed}（失败原因见列表）`
+            : `补全完成：成功重命名 ${job.succeeded} 个目录；写任务 #${jobId}，可在「写操作记录」撤销`,
+          job.failed > 0,
+        );
+        loadStats();
+      }
+    } catch { /* 网络抖动：下一拍再试 */ }
+    finally { ticking = false; }
+  }, 400);
 }
 
 /* ============================================================ 标签弹窗 */
