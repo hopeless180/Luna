@@ -184,6 +184,25 @@ test('apply：后台任务可观察——返回即执行中，awaitRefillIdle �
   assert.equal(job.succeeded, 1);
 });
 
+test('apply：可请求停止——当前条处理完就停，剩余条目标记已停止且绝不动盘', async () => {
+  const a = makeAlbum({ folder: '取消甲', title: '唯一命中作品', withAudio: true });
+  const b = makeAlbum({ folder: '取消乙', title: '带【装饰】作品-バイノーラル', withAudio: true });
+  const res = await refill.applyRefill([a.id, b.id]);
+  assert.equal(res.queued, 2);
+  assert.equal(refill.cancelRefill(), true);
+  await refill.awaitRefillIdle();
+  const job = store.db.prepare('SELECT * FROM write_jobs WHERE id = ?').get(res.jobId);
+  assert.equal(job.status, 'done');
+  assert.ok(job.skipped >= 1, '应至少有一条被停止');
+  const skippedItem = store.db.prepare(
+    "SELECT * FROM write_job_items WHERE job_id = ? AND status = 'skipped'",
+  ).get(res.jobId);
+  assert.ok(skippedItem, '剩余条目应标为 skipped');
+  assert.match(skippedItem.error, /已停止/);
+  assert.ok(fs.existsSync(b.dir), '被停止的目录必须原样保留');
+  assert.equal(refill.cancelRefill(), false, '空闲时停止请求应为空操作');
+});
+
 test('索引缺失时 plan 如实报告、不抛错', () => {
   const saved = process.env.LUNA_DLSITE_INDEX;
   process.env.LUNA_DLSITE_INDEX = path.join(root, '没有这个文件.sqlite3');

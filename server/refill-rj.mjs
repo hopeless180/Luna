@@ -187,11 +187,32 @@ function nearCandidates({ title, folder }) {
 
 let applying = false;
 let applyPromise = null;
+let cancelRequested = false;
 
 export function isApplying() { return applying; }
 
+/** 请求停止当前补全：当前这条处理完就停，未开始的条目记为「已停止（未执行）」 */
+export function cancelRefill() {
+  if (!applying) return false;
+  cancelRequested = true;
+  return true;
+}
+
 /** 等当前补全任务跑完（测试与维护用） */
 export function awaitRefillIdle() { return applyPromise ?? Promise.resolve(); }
+
+/** 单条重建的超时保护：改名已完成但重建卡住时,不能让整条任务无限期挂着 */
+const REBUILD_TIMEOUT_MS = 15000;
+
+function withTimeout(promise, ms) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`索引重建超时（${Math.round(ms / 1000)} 秒）`)), ms);
+    }),
+  ]).finally(() => { if (timer) clearTimeout(timer); });
+}
 
 /**
  * 执行重命名（破坏性，用户已确认）：登记写任务 → 后台逐条 改名 → 删旧记录 → 按新路径重扫入库。
@@ -264,6 +285,7 @@ export async function applyRefill(albumIds, { libraryId = null, choices = {} } =
   ));
 
   applying = true;
+  cancelRequested = false;
   applyPromise = processRefillJob(jobId, entries, itemIds)
     .catch((err) => {
       db.prepare("UPDATE write_jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?")
@@ -279,15 +301,22 @@ export async function applyRefill(albumIds, { libraryId = null, choices = {} } =
 /** 后台逐条推进任务；每一步都落库，前端轮询即可看到进度 */
 async function processRefillJob(jobId, entries, itemIds) {
   const item = db.prepare('UPDATE write_job_items SET status = ?, error = ?, backup_file = ? WHERE id = ?');
-  const counts = db.prepare('UPDATE write_jobs SET status = ?, succeeded = ?, skipped = 0, failed = ? WHERE id = ?');
+  const counts = db.prepare('UPDATE write_jobs SET status = ?, succeeded = ?, skipped = ?, failed = ? WHERE id = ?');
   let ok = 0;
   let bad = 0;
+  let skipped = 0;
   for (let i = 0; i < entries.length; i += 1) {
     const it = entries[i];
+    if (cancelRequested) {
+      skipped += 1;
+      item.run('skipped', '已停止（未执行）', null, itemIds[i]);
+      counts.run('running', ok, skipped, bad, jobId);
+      continue;
+    }
     if (it.presetError) {
       bad += 1;
       item.run('failed', it.presetError, null, itemIds[i]);
-      counts.run('running', ok, bad, jobId);
+      counts.run('running', ok, skipped, bad, jobId);
       continue;
     }
     item.run('running', null, null, itemIds[i]);
@@ -299,25 +328,28 @@ async function processRefillJob(jobId, entries, itemIds) {
         : `${err.code ?? '错误'}：${err.message}`;
       bad += 1;
       item.run('failed', reason, null, itemIds[i]);
-      counts.run('running', ok, bad, jobId);
+      counts.run('running', ok, skipped, bad, jobId);
       continue;
     }
-    // 改名成功即刻登记「还原点」（backup_file=旧路径）；重建属于后续步骤
-    let warning = null;
+    // 改名成功即刻算完成（磁盘上的名字已经变了），先落「还原点」与成功计数
+    ok += 1;
+    item.run('done', null, it.old_path, itemIds[i]);
+    counts.run('running', ok, skipped, bad, jobId);
+    // 重建索引是**改名之后**的事：带超时，卡住也只在本条留警告，绝不无限挂起整条任务
     try {
       store.deleteAlbumDeep(it.album_id);
-      await rescanReleaseRoot({ releaseRoot: it.new_path, libraryId: it.library_id });
+      await withTimeout(
+        rescanReleaseRoot({ releaseRoot: it.new_path, libraryId: it.library_id }),
+        REBUILD_TIMEOUT_MS,
+      );
     } catch (err) {
-      warning = `索引重建失败：${err.message}（下次扫描会自动重建）`;
+      item.run('done', `索引重建未完成：${err.message}（下次扫描会自动补上）`, it.old_path, itemIds[i]);
     }
-    ok += 1;
-    item.run('done', warning, it.old_path, itemIds[i]);
-    counts.run('running', ok, bad, jobId);
   }
   db.prepare(`
-    UPDATE write_jobs SET status = 'done', finished_at = ?, succeeded = ?, skipped = 0, failed = ?
+    UPDATE write_jobs SET status = 'done', finished_at = ?, succeeded = ?, skipped = ?, failed = ?
     WHERE id = ?
-  `).run(now(), ok, bad, jobId);
+  `).run(now(), ok, skipped, bad, jobId);
 }
 
 /**

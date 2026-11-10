@@ -175,7 +175,13 @@ app.post('/api/experimental/refill-rj/apply', asyncRoute(async (req, res) => {
     .map(Number).filter((n) => Number.isInteger(n) && n > 0);
   if (!albumIds.length) return badRequest(res, '未选择要回填的目录');
   const choices = req.body?.choices && typeof req.body.choices === 'object' ? req.body.choices : {};
+  // 数据安全：执行前先落一份用户资产快照（标签/收藏等），失败也不阻塞执行
+  try { assets.writeAutoBackup('补RJ号前自动备份'); } catch { /* 忽略 */ }
   res.json(await refillRj.applyRefill(albumIds, { libraryId: parseId(req.body?.libraryId), choices }));
+}));
+
+app.post('/api/experimental/refill-rj/cancel', asyncRoute(async (req, res) => {
+  res.json({ ok: refillRj.cancelRefill() });
 }));
 
 /* ---------------------------------------------------------------- libraries */

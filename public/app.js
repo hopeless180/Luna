@@ -2314,9 +2314,17 @@ function openRefillRjDialog(libraries) {
 
   // 事件用赋值绑定（每次点开都会走到这里，避免叠加监听）
   sel.onchange = () => refillDlgMatch();
+  sel.disabled = false;
   $('#refillRjRescan').onclick = () => refillDlgMatch();
+  $('#refillRjRescan').disabled = false;
   $('#refillRjDlgCancel').onclick = () => $('#refillRjDialog').close();
-  $('#refillRjDlgCancel2').onclick = () => $('#refillRjDialog').close();
+  $('#refillRjDlgCancel').disabled = false;
+  const cancelBtn = $('#refillRjDlgCancel2');
+  cancelBtn.textContent = '取消';
+  cancelBtn.disabled = false;
+  cancelBtn.onclick = () => $('#refillRjDialog').close();
+  // 执行中按 Esc 不允许直接关掉（防止误以为已停止；要退出得先点「停止执行」）
+  $('#refillRjDialog').oncancel = (e) => { if (refillDlg.busy) e.preventDefault(); };
   $('#refillRjDlgGo').onclick = () => refillDlgApply();
   $('#refillRjSearch').oninput = (e) => { refillDlg.query = e.target.value; renderRefillTable(); };
   $('#refillRjThreshold').oninput = (e) => {
@@ -2445,6 +2453,13 @@ async function refillDlgApply() {
     choices[id] = rj;
   }
   if (!ids.length) { toast('没有勾选任何目录', true); return; }
+  const ok = await askConfirm({
+    title: '执行补全',
+    text: `将重命名 ${ids.length} 个目录；这些专辑的旧入库记录会删除并按新目录名重建。执行前会自动备份用户资产，执行中可随时点「停止执行」。`,
+    okLabel: '执行',
+    danger: true,
+  });
+  if (!ok) return;
   refillDlg.busy = true;
   const go = $('#refillRjDlgGo');
   go.disabled = true;
@@ -2460,6 +2475,21 @@ async function refillDlgApply() {
   }
 }
 
+/** 请求停止执行：当前目录处理完就停，剩余条目不执行 */
+async function refillDlgStop() {
+  const btn = $('#refillRjDlgCancel2');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.textContent = '正在停止…';
+  try {
+    await api('/api/experimental/refill-rj/cancel', { method: 'POST', body: {} });
+  } catch (err) {
+    toast(`停止失败：${err.message}`, true);
+    btn.disabled = false;
+    btn.textContent = '停止执行';
+  }
+}
+
 /**
  * 执行进度视图：轮询 /api/jobs/:id，把每条目录的「等待中 / 正在修改 / 已完成 / 失败」
  * 实时画在表格位置；失败原因直接显示在该条目下方。结束后按钮变「关闭」，任务仍可在
@@ -2471,17 +2501,26 @@ function refillWatchJob(jobId) {
   const table = $('#refillRjTable');
   const go = $('#refillRjDlgGo');
   const cancel2 = $('#refillRjDlgCancel2');
+  const closeX = $('#refillRjDlgCancel');
+  const libSel = $('#refillRjLib');
+  const rescan = $('#refillRjRescan');
   const toolbar = $('#refillRjDialog .rf-toolbar');
-  const stateClass = { pending: 'is-faint', running: 'is-warn', done: 'is-ok', failed: 'is-danger' };
-  const stateText = { pending: '等待中', running: '正在修改', done: '已完成', failed: '失败' };
+  const stateClass = { pending: 'is-faint', running: 'is-warn', done: 'is-ok', failed: 'is-danger', skipped: 'is-faint' };
+  const stateText = { pending: '等待中', running: '正在修改', done: '已完成', failed: '失败', skipped: '已停止' };
 
   table.hidden = true;
   $('#refillRjEmpty').hidden = true;
   progress.hidden = false;
   progress.innerHTML = '<div class="rf-empty">正在创建任务…</div>';
   $('#refillRjTabs').innerHTML = '';
+  // 执行期隔离：根目录 / 重新匹配 / 过滤工具条全部不可操作
   toolbar.style.visibility = 'hidden';
-  cancel2.disabled = true;
+  libSel.disabled = true;
+  rescan.disabled = true;
+  closeX.disabled = true;
+  cancel2.textContent = '停止执行';
+  cancel2.disabled = false;
+  cancel2.onclick = () => refillDlgStop();
   go.disabled = true;
   go.textContent = '执行中…';
   let finished = false;
@@ -2495,7 +2534,8 @@ function refillWatchJob(jobId) {
       <span class="rf-chip is-faint">等待 <b>${n('pending')}</b></span>
       <span class="rf-chip is-warn">修改中 <b>${n('running')}</b></span>
       <span class="rf-chip is-ok">完成 <b>${n('done')}</b></span>
-      <span class="rf-chip is-danger">失败 <b>${n('failed')}</b></span>`;
+      <span class="rf-chip is-danger">失败 <b>${n('failed')}</b></span>
+      ${n('skipped') ? `<span class="rf-chip is-faint">已停止 <b>${n('skipped')}</b></span>` : ''}`;
     progress.innerHTML = items.map((it, i) => {
       const e = entries[i] ?? {};
       const st = stateClass[it.status] ? it.status : 'pending';
@@ -2512,7 +2552,8 @@ function refillWatchJob(jobId) {
         </div>`;
     }).join('');
     $('#refillRjFootInfo').innerHTML = `已完成 <b>${n('done')}</b> / ${items.length}`
-      + (n('failed') ? ` · 失败 <b>${n('failed')}</b>` : '');
+      + (n('failed') ? ` · 失败 <b>${n('failed')}</b>` : '')
+      + (n('skipped') ? ` · 已停止 <b>${n('skipped')}</b>` : '');
   };
 
   let ticking = false;
@@ -2527,14 +2568,21 @@ function refillWatchJob(jobId) {
         finished = true;
         clearInterval(timer);
         refillDlg.busy = false;
-        cancel2.disabled = false;
+        // 恢复可操作区域与按钮语义
         toolbar.style.visibility = '';
+        libSel.disabled = false;
+        rescan.disabled = false;
+        closeX.disabled = false;
+        cancel2.textContent = '取消';
+        cancel2.disabled = false;
+        cancel2.onclick = () => dialog.close();
         go.textContent = '关闭';
         go.disabled = false;
         go.onclick = () => dialog.close();
+        const stopped = job.skipped ? `，已停止 ${job.skipped}` : '';
         toast(
-          job.failed
-            ? `补全结束：成功 ${job.succeeded}，失败 ${job.failed}（失败原因见列表）`
+          job.failed || job.skipped
+            ? `补全结束：成功 ${job.succeeded}${stopped}${job.failed ? `，失败 ${job.failed}` : ''}（详情见列表）`
             : `补全完成：成功重命名 ${job.succeeded} 个目录；写任务 #${jobId}，可在「写操作记录」撤销`,
           job.failed > 0,
         );
